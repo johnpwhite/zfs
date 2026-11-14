@@ -278,6 +278,48 @@ For example, the following creates a pool with two root vdevs,
 each a mirror of two disks:
 .Dl # Nm zpool Cm create Ar mypool Sy mirror Ar sda sdb Sy mirror Ar sdc sdd
 .
+.Ss Async Mirrors
+An async mirror does not have the durability of a normal mirror.
+If the leader fails, every write since the lagging child's applied transaction
+group is lost.
+A write that fails on the leader is not written to the lagging child out of
+order.
+ZFS handles it as for a pool of one disk: the write is retried while the
+leader still answers, and the pool suspends if the leader stops answering.
+.Fn fsync
+returns when the data is on the leader; it does not wait for the lagging child.
+Writes to the intent log are not copied to the lagging child while the async
+mirror is on.
+A scrub checks blocks on the lagging child only through its applied transaction
+group.
+It skips newer blocks that the child does not hold.
+.Pp
+Version 1 supports exactly one two-way mirror as the pool's only data vdev.
+Log devices are allowed, but other data vdevs are not.
+The
+.Sy async_mirror
+property on a leaf selects the lagging child; see
+.Xr vdevprops 7 .
+The pool copies transaction groups to that child in the background and holds
+freed space until the child has passed the free.
+The read-only
+.Sy async_mirror_state
+property reports the leaf's current role or state.
+.Pp
+Set the leaf's
+.Sy async_mirror
+property to
+.Sy off
+before replacing, attaching, detaching, offlining, or splitting a child.
+Wait for the leaf's
+.Sy async_mirror_state
+to return to
+.Sy off
+before you change the mirror.
+See
+.Xr zpool-import 8
+for recovery when the copies have divergent histories.
+.
 .Ss Device Failure and Recovery
 ZFS supports a rich set of mechanisms for handling device failure and data
 corruption.

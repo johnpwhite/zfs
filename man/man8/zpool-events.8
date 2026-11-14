@@ -207,6 +207,29 @@ Issued when a errorscrub is aborted on a pool.
 Issued when a errorscrub is resumed on a pool.
 .It Sy errorscrub_paused
 Issued when a errorscrub is paused on a pool.
+.It Sy async_mirror_retry
+Issued when the copy of a transaction group to the lagging child of an
+asynchronous mirror fails with a read error, before the first of the tries of
+.Sy zfs_vdev_async_mirror_read_retries .
+The vdev is the leader.
+The payload has the transaction group
+.Pq Sy async_mirror_txg ,
+the error
+.Pq Sy async_mirror_errno ,
+the number of tries
+.Pq Sy async_mirror_retries ,
+and the delay before each try
+.Pq Sy async_mirror_delay_ms .
+.It Sy async_mirror_recovered
+Issued when a data block that the copy to the lagging child of an asynchronous
+mirror could not read, also after the tries of
+.Sy zfs_vdev_async_mirror_read_retries ,
+is read and copied when it is tried again.
+The vdev is the leader.
+The payload has the transaction group of the block
+.Pq Sy async_mirror_txg
+and its bookmark
+.Pq Sy async_mirror_objset , async_mirror_object , async_mirror_level , async_mirror_blkid .
 .It Sy trim_start
 Issued when a trim is started on a pool.
 .It Sy trim_finish
