@@ -98,6 +98,7 @@
 #include <sys/zil.h>
 #include <sys/zil_impl.h>
 #include <sys/vdev_anyraid.h>
+#include <sys/vdev_async_mirror.h>
 #include <sys/vdev_draid.h>
 #include <sys/vdev_impl.h>
 #include <sys/vdev_file.h>
@@ -198,6 +199,7 @@ typedef struct ztest_shared_opts {
 	uint64_t zo_metaslab_force_ganging;
 	raidz_expand_test_state_t zo_raidz_expand_test;
 	int zo_mmp_test;
+	int zo_async_mirror;
 	int zo_special_vdevs;
 	int zo_dump_dbgmsg;
 	int zo_fishing;
@@ -254,6 +256,7 @@ static const ztest_shared_opts_t ztest_opts_defaults = {
 	.zo_killrate = DEFAULT_KILL_RATE,
 	.zo_verbose = 0,
 	.zo_mmp_test = 0,
+	.zo_async_mirror = 0,
 	.zo_init = DEFAULT_INITS,
 	.zo_time = DEFAULT_RUN_TIME,
 	.zo_maxloops = DEFAULT_MAX_LOOPS, /* max loops during spa_freeze() */
@@ -265,6 +268,7 @@ static const ztest_shared_opts_t ztest_opts_defaults = {
 };
 
 extern uint64_t metaslab_force_ganging;
+extern uint_t metaslab_force_ganging_pct;
 extern uint64_t metaslab_df_alloc_threshold;
 extern uint64_t zfs_deadman_synctime_ms;
 extern uint_t metaslab_preload_limit;
@@ -457,6 +461,8 @@ ztest_func_t ztest_ddt_prune;
 ztest_func_t ztest_spa_log_flushall_start;
 ztest_func_t ztest_spa_log_flushall_cancel;
 ztest_func_t ztest_scrub_prefetch;
+ztest_func_t ztest_async_mirror_suspend;
+ztest_func_t ztest_async_mirror_refusals;
 
 static uint64_t zopt_always = 0ULL * NANOSEC;		/* all the time */
 static uint64_t zopt_incessant = 1ULL * NANOSEC / 10;	/* every 1/10 second */
@@ -513,6 +519,8 @@ static ztest_info_t ztest_info[] = {
 	ZTI_INIT(ztest_spa_log_flushall_start, 1, &zopt_rarely),
 	ZTI_INIT(ztest_spa_log_flushall_cancel, 1, &zopt_rarely),
 	ZTI_INIT(ztest_scrub_prefetch, 1, &zopt_rarely),
+	ZTI_INIT(ztest_async_mirror_suspend, 1, &zopt_sometimes),
+	ZTI_INIT(ztest_async_mirror_refusals, 1, &zopt_sometimes),
 };
 
 #define	ZTEST_FUNCS	(sizeof (ztest_info) / sizeof (ztest_info_t))
@@ -561,6 +569,50 @@ static kmutex_t ztest_vdev_lock;
 static boolean_t ztest_device_removal_active = B_FALSE;
 static boolean_t ztest_pool_scrubbed = B_FALSE;
 static kmutex_t ztest_checkpoint_lock;
+
+/*
+ * Asynchronous mirror (-A).  Set the async_mirror property of the lagging
+ * leaf, as "zpool set async_mirror=lagging" does.  The property is kept in
+ * the leaf ZAP, so the later imports of the pool keep the mode.  This is the
+ * one place that knows how the mode is turned on.
+ */
+static void
+ztest_async_mirror_enable(spa_t *spa, uint64_t guid)
+{
+	nvlist_t *props = fnvlist_alloc();
+	nvlist_t *innvl = fnvlist_alloc();
+	nvlist_t *outnvl = fnvlist_alloc();
+
+	fnvlist_add_uint64(props, vdev_prop_to_name(VDEV_PROP_ASYNC_MIRROR),
+	    VDEV_ASYNC_MIRROR_LAGGING);
+	fnvlist_add_uint64(innvl, ZPOOL_VDEV_PROPS_SET_VDEV, guid);
+	fnvlist_add_nvlist(innvl, ZPOOL_VDEV_PROPS_SET_PROPS, props);
+	VERIFY0(vdev_prop_set(spa, innvl, outnvl));
+	fnvlist_free(outnvl);
+	fnvlist_free(innvl);
+	fnvlist_free(props);
+}
+
+/* Stop or restart the copy to the lagging child. */
+static void
+ztest_async_mirror_suspend_copy(boolean_t suspend)
+{
+	VERIFY0(handle_tunable_option(suspend ?
+	    "zfs_vdev_async_mirror_suspend_copy=1" :
+	    "zfs_vdev_async_mirror_suspend_copy=0", B_TRUE));
+}
+
+/*
+ * True if this run uses the asynchronous mirror and the pool has the mode on
+ * (or still drains its lists).  The operations that the mode refuses skip
+ * themselves when this is true.
+ */
+static boolean_t
+ztest_async_mirror_in_use(void)
+{
+	return (ztest_opts.zo_async_mirror &&
+	    vdev_async_mirror_in_use(ztest_spa));
+}
 
 /*
  * The ztest_name_lock protects the pool and dataset namespace used by
@@ -785,6 +837,9 @@ static ztest_option_t option_table[] = {
 	    NO_DEFAULT, DEFAULT_VDEV_DIR},
 	{ 'M',	"multi-host", NULL,
 	    "Multi-host; create the pool with multihost enabled",
+	    NO_DEFAULT, NULL},
+	{ 'A',	"async-mirror", NULL,
+	    "Use one two-way mirror and turn on the asynchronous mirror mode",
 	    NO_DEFAULT, NULL},
 	{ 'E',	"use-existing-pool", NULL,
 	    "Use existing pool instead of creating new one", NO_DEFAULT, NULL},
@@ -1239,6 +1294,9 @@ process_options(int argc, char **argv)
 		case 'M':
 			zo->zo_mmp_test = 1;
 			break;
+		case 'A':
+			zo->zo_async_mirror = 1;
+			break;
 		case 'V':
 			zo->zo_verbose++;
 			break;
@@ -1342,6 +1400,25 @@ process_options(int argc, char **argv)
 	if (zo->zo_mmp_test && get_system_hostid() == 0) {
 		(void) fprintf(stderr, "-M requires a non-zero hostid\n");
 		exit(1);
+	}
+
+	/*
+	 * The asynchronous mirror needs one two-way mirror as its only data
+	 * top-level vdev, and it cannot run with multihost.
+	 */
+	if (zo->zo_async_mirror) {
+		if (zo->zo_mmp_test) {
+			(void) fprintf(stderr,
+			    "-A cannot be used with -M\n");
+			usage(B_FALSE);
+		}
+		zo->zo_raidz_expand_test = RAIDZ_EXPAND_NONE;
+		zo->zo_mirrors = 2;
+		zo->zo_vdevs = 1;
+		zo->zo_raid_children = 1;
+		zo->zo_raid_parity = 1;
+		zo->zo_special_vdevs = ZTEST_VDEV_CLASS_OFF;
+		raid_kind = "raidz";
 	}
 
 	if (strcmp(raid_kind, "random") == 0) {
@@ -3417,6 +3494,14 @@ ztest_spa_checkpoint(spa_t *spa)
 	case ZFS_ERR_CHECKPOINT_EXISTS:
 	case ZFS_ERR_RAIDZ_EXPAND_IN_PROGRESS:
 		break;
+	case ENOTSUP:
+		/* The mode and a checkpoint do not compose. */
+		if (!ztest_async_mirror_in_use() &&
+		    spa_async_mirror_lineage(spa) == 0) {
+			fatal(B_FALSE, "spa_checkpoint(%s) = %d",
+			    spa->spa_name, error);
+		}
+		break;
 	case ENOSPC:
 		ztest_record_enospc(FTAG);
 		break;
@@ -3502,6 +3587,10 @@ ztest_vdev_add_remove(ztest_ds_t *zd, uint64_t id)
 	int error;
 
 	if (ztest_opts.zo_mmp_test)
+		return;
+
+	/* A data top-level vdev cannot be added while the mode is on. */
+	if (ztest_async_mirror_in_use())
 		return;
 
 	mutex_enter(&ztest_vdev_lock);
@@ -3592,6 +3681,10 @@ ztest_vdev_class_add(ztest_ds_t *zd, uint64_t id)
 	const char *class = (ztest_random(2) == 0) ?
 	    VDEV_ALLOC_BIAS_SPECIAL : VDEV_ALLOC_BIAS_DEDUP;
 	int error;
+
+	/* A special or dedup vdev holds pool data: the mode refuses it. */
+	if (ztest_async_mirror_in_use())
+		return;
 
 	/*
 	 * By default add a special vdev 50% of the time
@@ -3789,6 +3882,10 @@ ztest_split_pool(ztest_ds_t *zd, uint64_t id)
 	if (ztest_opts.zo_mmp_test)
 		return;
 
+	/* The mode refuses a split. */
+	if (ztest_async_mirror_in_use())
+		return;
+
 	mutex_enter(&ztest_vdev_lock);
 
 	/* ensure we have a usable config; mirrors of raidz aren't supported */
@@ -3897,6 +3994,13 @@ ztest_vdev_attach_detach(ztest_ds_t *zd, uint64_t id)
 	int error, expected_error;
 
 	if (ztest_opts.zo_mmp_test)
+		return;
+
+	/*
+	 * The mode refuses attach, detach and replace of its children.
+	 * ztest_async_mirror_refusals() checks the refusal.
+	 */
+	if (ztest_async_mirror_in_use())
 		return;
 
 	oldpath = kmem_alloc(MAXPATHLEN, KM_SLEEP);
@@ -4392,6 +4496,10 @@ ztest_device_removal(ztest_ds_t *zd, uint64_t id)
 	vdev_t *vd;
 	uint64_t guid;
 	int error;
+
+	/* The mode refuses the removal of its top-level vdev. */
+	if (ztest_async_mirror_in_use())
+		return;
 
 	mutex_enter(&ztest_vdev_lock);
 
@@ -6687,6 +6795,14 @@ ztest_fault_inject(ztest_ds_t *zd, uint64_t id)
 		leaf = ztest_random(leaves) + zs->zs_splits;
 
 		/*
+		 * A block that the leader holds and the lagging child does
+		 * not hold yet has no other copy, so damage to the leader
+		 * cannot be repaired.  Damage the lagging child only.
+		 */
+		if (ztest_async_mirror_in_use())
+			leaf = 1;
+
+		/*
 		 * Generate paths to the first leaf in this top-level vdev,
 		 * and to the random leaf we selected.  We'll induce transient
 		 * write failures and random online/offline activity on leaf 0,
@@ -6988,6 +7104,11 @@ ztest_reguid(ztest_ds_t *zd, uint64_t id)
 	zs->zs_guid = spa_guid(spa);
 	(void) pthread_rwlock_unlock(&ztest_name_lock);
 
+	/* The labels of the lagging child would keep the old guid. */
+	if (ztest_async_mirror_in_use() &&
+	    vdev_async_mirror_active(spa))
+		VERIFY3S(error, ==, ZFS_ERR_ASYNC_MIRROR_ACTIVE);
+
 	if (error != 0)
 		return;
 
@@ -6998,6 +7119,82 @@ ztest_reguid(ztest_ds_t *zd, uint64_t id)
 
 	VERIFY3U(orig, !=, spa_guid(spa));
 	VERIFY3U(load, ==, spa_load_guid(spa));
+}
+
+/*
+ * Stop the copy to the lagging child for a short time, and start it again.
+ * The leader runs ahead, so the list of blocks to copy grows and the
+ * holds on freed space grow with it.
+ */
+void
+ztest_async_mirror_suspend(ztest_ds_t *zd, uint64_t id)
+{
+	(void) zd, (void) id;
+	static volatile uint32_t suspended = 0;
+
+	if (!ztest_async_mirror_in_use())
+		return;
+
+	/* One at a time. */
+	if (atomic_cas_32(&suspended, 0, 1) != 0)
+		return;
+
+	ztest_async_mirror_suspend_copy(B_TRUE);
+	(void) poll(NULL, 0, 100 + ztest_random(2000));
+	ztest_async_mirror_suspend_copy(B_FALSE);
+
+	atomic_swap_32(&suspended, 0);
+}
+
+/*
+ * The mode refuses to detach, offline or remove either child of its mirror,
+ * and to remove the mirror.  Try each one and check the refusal.
+ */
+void
+ztest_async_mirror_refusals(ztest_ds_t *zd, uint64_t id)
+{
+	(void) zd, (void) id;
+	spa_t *spa = ztest_spa;
+	uint64_t guids[3];
+	int error;
+
+	if (!ztest_async_mirror_in_use() || !vdev_async_mirror_active(spa))
+		return;
+
+	mutex_enter(&ztest_vdev_lock);
+
+	spa_config_enter(spa, SCL_VDEV, FTAG, RW_READER);
+	vdev_t *tvd = spa->spa_root_vdev->vdev_child[0];
+	ASSERT3U(tvd->vdev_children, ==, 2);
+	guids[0] = tvd->vdev_child[0]->vdev_guid;
+	guids[1] = tvd->vdev_child[1]->vdev_guid;
+	guids[2] = tvd->vdev_guid;
+	spa_config_exit(spa, SCL_VDEV, FTAG);
+
+	for (int c = 0; c < 2; c++) {
+		error = spa_vdev_detach(spa, guids[c], 0, B_FALSE);
+		if (error != ZFS_ERR_ASYNC_MIRROR_ACTIVE) {
+			fatal(B_FALSE, "spa_vdev_detach(%"PRIu64") = %d, "
+			    "expected the async mirror refusal", guids[c],
+			    error);
+		}
+
+		error = vdev_offline(spa, guids[c],
+		    ztest_random(2) == 0 ? ZFS_OFFLINE_TEMPORARY : 0);
+		if (error != ZFS_ERR_ASYNC_MIRROR_ACTIVE) {
+			fatal(B_FALSE, "vdev_offline(%"PRIu64") = %d, "
+			    "expected the async mirror refusal", guids[c],
+			    error);
+		}
+	}
+
+	error = spa_vdev_remove(spa, guids[2], B_FALSE);
+	if (error != ENOTSUP) {
+		fatal(B_FALSE, "spa_vdev_remove(%"PRIu64") = %d, "
+		    "expected ENOTSUP", guids[2], error);
+	}
+
+	mutex_exit(&ztest_vdev_lock);
 }
 
 void
@@ -9137,6 +9334,14 @@ ztest_run(ztest_shared_t *zs)
 	spa_namespace_exit(FTAG);
 
 	/*
+	 * Half of the passes stop the copy to the lagging child before the
+	 * export, so the pool is left with a lagging child that is behind, as
+	 * a crash leaves it.  The next pass must resume the copy.
+	 */
+	if (ztest_opts.zo_async_mirror && ztest_random(2) == 0)
+		ztest_async_mirror_suspend_copy(B_TRUE);
+
+	/*
 	 * Verify that we can export the pool and reimport it under a
 	 * different name.
 	 */
@@ -9149,6 +9354,10 @@ ztest_run(ztest_shared_t *zs)
 	}
 
 	kernel_fini();
+
+	/* Check the exported pool, as the initialization does. */
+	if (ztest_opts.zo_async_mirror)
+		ztest_run_zdb(zs->zs_guid);
 
 	list_destroy(&zcl.zcl_callbacks);
 	mutex_destroy(&zcl.zcl_callbacks_lock);
@@ -9292,6 +9501,14 @@ ztest_init(ztest_shared_t *zs)
 	zs->zs_metaslab_sz =
 	    1ULL << spa->spa_root_vdev->vdev_child[0]->vdev_ms_shift;
 	zs->zs_guid = spa_guid(spa);
+
+	/* The second child of the mirror is the lagging child. */
+	if (ztest_opts.zo_async_mirror) {
+		vdev_t *tvd = spa->spa_root_vdev->vdev_child[0];
+
+		ASSERT3U(tvd->vdev_children, ==, 2);
+		ztest_async_mirror_enable(spa, tvd->vdev_child[1]->vdev_guid);
+	}
 	spa_close(spa, FTAG);
 
 	kernel_fini();
@@ -9599,6 +9816,12 @@ main(int argc, char **argv)
 
 	if (fd_data_str) {
 		metaslab_force_ganging = ztest_opts.zo_metaslab_force_ganging;
+		/*
+		 * The copy to the lagging child walks each gang block
+		 * on its own path: make many blocks gang blocks.
+		 */
+		if (ztest_opts.zo_async_mirror)
+			metaslab_force_ganging_pct = 50;
 		metaslab_df_alloc_threshold =
 		    zs->zs_metaslab_df_alloc_threshold;
 
