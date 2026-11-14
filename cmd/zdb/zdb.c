@@ -51,6 +51,7 @@
 #include <sys/vdev.h>
 #include <sys/vdev_impl.h>
 #include <sys/vdev_anyraid.h>
+#include <sys/vdev_async_mirror.h>
 #include <sys/metaslab_impl.h>
 #include <sys/dmu_objset.h>
 #include <sys/dsl_dir.h>
@@ -1594,6 +1595,44 @@ get_log_spacemap_refcount(spa_t *spa, zfs_range_tree_t *spacemap_objs)
 	return (refcount);
 }
 
+static uint64_t
+async_mirror_rec_zap(spa_t *spa)
+{
+	uint64_t zap;
+
+	if (zap_lookup(spa_meta_objset(spa), DMU_POOL_DIRECTORY_OBJECT,
+	    DMU_POOL_ASYNC_MIRROR_ZAP, sizeof (zap), 1, &zap) != 0)
+		return (0);
+	return (zap);
+}
+
+static int
+async_mirror_refcount_cb(uint64_t txg, const async_mirror_rec_phys_t *rec,
+    void *arg)
+{
+	zfs_range_tree_t *spacemap_objs = arg;
+
+	(void) txg;
+	if (spacemap_objs != NULL &&
+	    !zfs_range_tree_contains(spacemap_objs, rec->amr_sm_obj, 1))
+		zfs_range_tree_add(spacemap_objs, rec->amr_sm_obj, 1);
+	return (0);
+}
+
+static uint64_t
+get_async_mirror_refcount(spa_t *spa, zfs_range_tree_t *spacemap_objs)
+{
+	uint64_t zap = async_mirror_rec_zap(spa);
+	uint64_t refcount = 0;
+
+	if (zap == 0)
+		return (0);
+	VERIFY0(zap_count(spa_meta_objset(spa), zap, &refcount));
+	VERIFY0(async_mirror_rec_iterate(spa_meta_objset(spa), zap,
+	    async_mirror_refcount_cb, spacemap_objs));
+	return (refcount);
+}
+
 static void
 dump_spacemap_refcount_mismatch_details(spa_t *spa,
     uint64_t expected_refcount, uint64_t actual_refcount,
@@ -1667,7 +1706,8 @@ verify_spacemap_refcounts(spa_t *spa)
 	uint64_t expected_refcount = 0;
 	uint64_t actual_refcount = 0;
 	uint64_t dtl_refcount, metaslab_refcount, obsolete_refcount,
-	    prev_obsolete_refcount, checkpoint_refcount, log_spacemap_refcount;
+	    prev_obsolete_refcount, checkpoint_refcount, log_spacemap_refcount,
+	    async_mirror_refcount;
 	zfs_range_tree_t *spacemap_objs = zfs_range_tree_create_flags(
 	    NULL, ZFS_RANGE_SEG64, NULL, 0, 0, 0,
 	    "verify_spacemap_refcounts:spacemap_objs");
@@ -1685,9 +1725,11 @@ verify_spacemap_refcounts(spa_t *spa)
 	checkpoint_refcount = get_checkpoint_refcount(spa->spa_root_vdev,
 	    spacemap_objs);
 	log_spacemap_refcount = get_log_spacemap_refcount(spa, spacemap_objs);
+	async_mirror_refcount = get_async_mirror_refcount(spa, spacemap_objs);
 	actual_refcount = dtl_refcount + metaslab_refcount +
 	    obsolete_refcount + prev_obsolete_refcount +
-	    checkpoint_refcount + log_spacemap_refcount;
+	    checkpoint_refcount + log_spacemap_refcount +
+	    async_mirror_refcount;
 
 	if (expected_refcount != actual_refcount) {
 		(void) printf("space map refcount mismatch: expected %llu != "
@@ -1696,13 +1738,14 @@ verify_spacemap_refcounts(spa_t *spa)
 		    (u_longlong_t)actual_refcount);
 		(void) printf("\tDTL: %llu, metaslab: %llu, obsolete: %llu, "
 		    "prev obsolete: %llu, checkpoint: %llu, "
-		    "log spacemap: %llu\n",
+		    "log spacemap: %llu, async mirror: %llu\n",
 		    (u_longlong_t)dtl_refcount,
 		    (u_longlong_t)metaslab_refcount,
 		    (u_longlong_t)obsolete_refcount,
 		    (u_longlong_t)prev_obsolete_refcount,
 		    (u_longlong_t)checkpoint_refcount,
-		    (u_longlong_t)log_spacemap_refcount);
+		    (u_longlong_t)log_spacemap_refcount,
+		    (u_longlong_t)async_mirror_refcount);
 		dump_spacemap_refcount_mismatch_details(spa, expected_refcount,
 		    actual_refcount, spacemap_objs);
 		zfs_range_tree_vacate(spacemap_objs, NULL, NULL);
@@ -2140,6 +2183,59 @@ dump_log_spacemaps(spa_t *spa)
 		    (u_longlong_t)sls->sls_sm_obj, (u_longlong_t)sls->sls_txg);
 		dump_spacemap(spa->spa_meta_objset, sm);
 		space_map_close(sm);
+	}
+	(void) printf("\n");
+}
+
+static int
+dump_async_mirror_rec_cb(uint64_t txg, const async_mirror_rec_phys_t *rec,
+    void *arg)
+{
+	objset_t *mos = arg;
+	space_map_t *sm = NULL;
+
+	VERIFY0(space_map_open(&sm, mos, rec->amr_sm_obj, 0, UINT64_MAX,
+	    SPA_MINBLOCKSHIFT));
+	(void) printf("\ttxg %llu leaf %llu space map %llu length %llu\n",
+	    (u_longlong_t)txg, (u_longlong_t)rec->amr_leaf_guid,
+	    (u_longlong_t)rec->amr_sm_obj, (u_longlong_t)space_map_length(sm));
+	if (dump_opt['d'] >= 6 || dump_opt['m'] >= 4)
+		dump_spacemap(mos, sm);
+	space_map_close(sm);
+	return (0);
+}
+
+/* Print the lineage and the records of an asynchronous mirror. */
+static void
+dump_async_mirror(spa_t *spa)
+{
+	objset_t *mos = spa_meta_objset(spa);
+	async_mirror_lineage_phys_t lin;
+	uint64_t zap = async_mirror_rec_zap(spa);
+
+	if (zap_lookup(mos, DMU_POOL_DIRECTORY_OBJECT,
+	    DMU_POOL_ASYNC_MIRROR_LINEAGE, sizeof (uint64_t),
+	    ASYNC_MIRROR_LINEAGE_WORDS, &lin) == 0) {
+		(void) printf("\nAsynchronous Mirror Lineage:\n");
+		(void) printf("\tversion = %llu\n",
+		    (u_longlong_t)lin.aml_version);
+		(void) printf("\tlineage = %llu\n",
+		    (u_longlong_t)lin.aml_lineage);
+		(void) printf("\tlineage_parent = %llu\n",
+		    (u_longlong_t)lin.aml_parent);
+		(void) printf("\tlineage_fork_txg = %llu\n",
+		    (u_longlong_t)lin.aml_fork_txg);
+		(void) printf("\tlineage_absent = %llu\n",
+		    (u_longlong_t)lin.aml_absent);
+		(void) printf("\tlineage_seen = %llu\n",
+		    (u_longlong_t)lin.aml_seen);
+		(void) printf("\tlineage_flags = %llx\n",
+		    (u_longlong_t)lin.aml_flags);
+	}
+	if (zap != 0) {
+		(void) printf("\nAsynchronous Mirror Records:\n");
+		VERIFY0(async_mirror_rec_iterate(mos, zap,
+		    dump_async_mirror_rec_cb, mos));
 	}
 	(void) printf("\n");
 }
@@ -6282,6 +6378,7 @@ typedef struct zdb_cb {
 	zdb_blkstats_t	zcb_type[ZB_TOTAL + 1][ZDB_OT_TOTAL + 1];
 	uint64_t	zcb_removing_size;
 	uint64_t	zcb_checkpoint_size;
+	uint64_t	zcb_async_mirror_held_size;
 	uint64_t	zcb_dedup_asize;
 	uint64_t	zcb_dedup_blocks;
 	uint64_t	zcb_clone_asize;
@@ -7304,6 +7401,60 @@ zdb_leak_init_exclude_checkpoint(spa_t *spa, zdb_cb_t *zcb)
 	}
 }
 
+/*
+ * Exclude the space that an asynchronous mirror still holds.  It is
+ * allocated in ms_sm, but no block points to it any more.
+ */
+static int
+async_mirror_exclude_entry_cb(space_map_entry_t *sme, void *arg)
+{
+	zdb_cb_t *zcb = arg;
+
+	if (sme->sme_type != SM_FREE)
+		return (0);
+
+	vdev_t *vd = vdev_lookup_top(zcb->zcb_spa, sme->sme_vdev);
+	metaslab_t *ms = vd->vdev_ms[sme->sme_offset >> vd->vdev_ms_shift];
+
+	mutex_enter(&ms->ms_lock);
+	zfs_range_tree_remove(ms->ms_allocatable, sme->sme_offset,
+	    sme->sme_run);
+	mutex_exit(&ms->ms_lock);
+
+	zcb->zcb_async_mirror_held_size += sme->sme_run;
+	return (0);
+}
+
+static int
+async_mirror_exclude_rec_cb(uint64_t txg, const async_mirror_rec_phys_t *rec,
+    void *arg)
+{
+	zdb_cb_t *zcb = arg;
+	space_map_t *sm = NULL;
+
+	(void) txg;
+	VERIFY0(space_map_open(&sm, spa_meta_objset(zcb->zcb_spa),
+	    rec->amr_sm_obj, 0, UINT64_MAX, SPA_MINBLOCKSHIFT));
+	VERIFY0(space_map_iterate(sm, space_map_length(sm),
+	    async_mirror_exclude_entry_cb, zcb));
+	space_map_close(sm);
+	return (0);
+}
+
+static void
+zdb_leak_init_exclude_async_mirror(spa_t *spa, zdb_cb_t *zcb)
+{
+	uint64_t zap = async_mirror_rec_zap(spa);
+
+	if (zap == 0)
+		return;
+
+	spa_config_enter(spa, SCL_CONFIG, FTAG, RW_READER);
+	VERIFY0(async_mirror_rec_iterate(spa_meta_objset(spa), zap,
+	    async_mirror_exclude_rec_cb, zcb));
+	spa_config_exit(spa, SCL_CONFIG, FTAG);
+}
+
 static int
 count_unflushed_space_cb(spa_t *spa, space_map_entry_t *sme,
     uint64_t txg, void *arg)
@@ -7570,6 +7721,7 @@ zdb_leak_init(spa_t *spa, zdb_cb_t *zcb)
 	 * [see comment in checkpoint_sm_exclude_entry_cb()]
 	 */
 	zdb_leak_init_exclude_checkpoint(spa, zcb);
+	zdb_leak_init_exclude_async_mirror(spa, zcb);
 	ASSERT3U(zcb->zcb_checkpoint_size, ==, spa_get_checkpoint_space(spa));
 
 	/* for cleaner progress output */
@@ -8085,7 +8237,8 @@ dump_block_stats(spa_t *spa)
 	    get_unflushed_alloc_space(spa);
 	total_found =
 	    tzb->zb_asize - zcb->zcb_dedup_asize - zcb->zcb_clone_asize +
-	    zcb->zcb_removing_size + zcb->zcb_checkpoint_size;
+	    zcb->zcb_removing_size + zcb->zcb_checkpoint_size +
+	    zcb->zcb_async_mirror_held_size;
 
 	if (total_found == total_alloc && !dump_opt['L']) {
 		(void) printf("\n\tNo leaks (block sum matches space"
@@ -9155,6 +9308,31 @@ mos_leak_log_spacemaps(spa_t *spa)
 		mos_obj_refd(sls->sls_sm_obj);
 }
 
+static int
+mos_leak_async_mirror_cb(uint64_t txg, const async_mirror_rec_phys_t *rec,
+    void *arg)
+{
+	(void) txg, (void) arg;
+	mos_obj_refd(rec->amr_sm_obj);
+	return (0);
+}
+
+static void
+mos_leak_async_mirror(spa_t *spa)
+{
+	objset_t *mos = spa_meta_objset(spa);
+	uint64_t zap = async_mirror_rec_zap(spa);
+
+	if (zap != 0) {
+		mos_obj_refd(zap);
+		VERIFY0(async_mirror_rec_iterate(mos, zap,
+		    mos_leak_async_mirror_cb, NULL));
+	}
+	if (zap_lookup(mos, DMU_POOL_DIRECTORY_OBJECT,
+	    DMU_POOL_ASYNC_MIRROR_DEFERRED, sizeof (zap), 1, &zap) == 0)
+		mos_obj_refd(zap);
+}
+
 static void
 errorlog_count_refd(objset_t *mos, uint64_t errlog)
 {
@@ -9209,6 +9387,7 @@ dump_mos_leaks(spa_t *spa)
 	if (spa->spa_syncing_log_sm != NULL)
 		mos_obj_refd(spa->spa_syncing_log_sm->sm_object);
 	mos_leak_log_spacemaps(spa);
+	mos_leak_async_mirror(spa);
 
 	mos_obj_refd(spa->spa_condensing_indirect_phys.
 	    scip_next_mapping_object);
@@ -9428,6 +9607,7 @@ dump_zpool(spa_t *spa)
 	if (dump_opt['d'] > 2 || dump_opt['m']) {
 		dump_log_spacemaps(spa);
 		dump_log_spacemap_obsolete_stats(spa);
+		dump_async_mirror(spa);
 	}
 
 	if (dump_opt['d'] || dump_opt['i']) {
