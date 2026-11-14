@@ -392,6 +392,12 @@ vdev_prop_init(void)
 		{ NULL }
 	};
 
+	static const zprop_index_t vdev_async_mirror_table[] = {
+		{ "off",	VDEV_ASYNC_MIRROR_OFF },
+		{ "lagging",	VDEV_ASYNC_MIRROR_LAGGING },
+		{ NULL }
+	};
+
 	struct zfs_mod_supported_features *sfeatures =
 	    zfs_mod_list_supported(ZFS_SYSFS_VDEV_PROPERTIES);
 
@@ -399,6 +405,9 @@ vdev_prop_init(void)
 	zprop_register_string(VDEV_PROP_COMMENT, "comment", NULL,
 	    PROP_DEFAULT, ZFS_TYPE_VDEV, "<comment-string>", "COMMENT",
 	    sfeatures);
+	zprop_register_string(VDEV_PROP_ASYNC_MIRROR_STATE,
+	    "async_mirror_state", NULL, PROP_READONLY, ZFS_TYPE_VDEV, "<state>",
+	    "AMSTATE", sfeatures);
 	zprop_register_string(VDEV_PROP_PATH, "path", NULL,
 	    PROP_DEFAULT, ZFS_TYPE_VDEV, "<device-path>", "PATH", sfeatures);
 	zprop_register_string(VDEV_PROP_DEVID, "devid", NULL,
@@ -573,6 +582,9 @@ vdev_prop_init(void)
 	    VDEV_BIAS_NONE, PROP_DEFAULT, ZFS_TYPE_VDEV,
 	    "none | log | special | dedup", "ALLOC_BIAS",
 	    vdev_alloc_bias_table, sfeatures);
+	zprop_register_index(VDEV_PROP_ASYNC_MIRROR, "async_mirror",
+	    VDEV_ASYNC_MIRROR_OFF, PROP_DEFAULT, ZFS_TYPE_VDEV, "off | lagging",
+	    "ASYNC_MIRROR", vdev_async_mirror_table, sfeatures);
 	zprop_register_index(VDEV_PROP_ROTATIONAL, "rotational", 0,
 	    PROP_READONLY, ZFS_TYPE_VDEV, "on | off", "ROTATIONAL",
 	    boolean_table, sfeatures);

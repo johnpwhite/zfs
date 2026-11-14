@@ -34,6 +34,7 @@
 #include <sys/dmu_tx.h>
 #include <sys/dsl_dir.h>
 #include <sys/vdev_impl.h>
+#include <sys/vdev_async_mirror.h>
 #include <sys/vdev_rebuild.h>
 #include <sys/vdev_draid.h>
 #include <sys/uberblock_impl.h>
@@ -1098,6 +1099,9 @@ vdev_alloc(spa_t *spa, vdev_t **vdp, nvlist_t *nv, vdev_t *parent, uint_t id,
 			    &vd->vdev_dtl_object);
 			(void) nvlist_lookup_uint64(nv, ZPOOL_CONFIG_UNSPARE,
 			    &vd->vdev_unspare);
+			(void) nvlist_lookup_uint64(nv,
+			    ZPOOL_CONFIG_ASYNC_MIRROR_LAGGING,
+			    &vd->vdev_async_lagging);
 		}
 
 		if (alloctype == VDEV_ALLOC_ROOTPOOL) {
@@ -2759,10 +2763,15 @@ vdev_validate(vdev_t *vd)
 	/*
 	 * If this is a verbatim import, no need to check the
 	 * state of the pool.
+	 *
+	 * The pool writes no labels to a lagging child of an asynchronous
+	 * mirror, so its labels can keep the state of the last export; its
+	 * leader gets every label and still refuses an exported pool.
 	 */
 	if (!(spa->spa_import_flags & ZFS_IMPORT_VERBATIM) &&
 	    spa_load_state(spa) == SPA_LOAD_OPEN &&
-	    state != POOL_STATE_ACTIVE) {
+	    state != POOL_STATE_ACTIVE &&
+	    !(vd->vdev_async_lagging && state == POOL_STATE_EXPORTED)) {
 		vdev_dbgmsg(vd, "vdev_validate: invalid pool state (%llu) "
 		    "for spa %s", (u_longlong_t)state, spa->spa_name);
 		return (SET_ERROR(EBADF));
@@ -4150,6 +4159,16 @@ vdev_load(vdev_t *vd)
 		if (error && error != ENOENT)
 			vdev_dbgmsg(vd, "vdev_load: zap_lookup(zap=%llu) "
 			    "failed [error=%d]", (u_longlong_t)zapobj, error);
+
+		if (spa_feature_is_enabled(vd->vdev_spa,
+		    SPA_FEATURE_ASYNC_MIRROR)) {
+			error = vdev_prop_get_int(vd, VDEV_PROP_ASYNC_MIRROR,
+			    &vd->vdev_async_mirror);
+			if (error && error != ENOENT) {
+				vdev_dbgmsg(vd, "vdev_load: cannot read the "
+				    "async_mirror property [error=%d]", error);
+			}
+		}
 	}
 
 	/*
@@ -4599,6 +4618,13 @@ vdev_fault(spa_t *spa, uint64_t guid, vdev_aux_t aux)
 
 	tvd = vd->vdev_top;
 
+	/* 'zpool offline -f' is an offline too; refuse it as vdev_offline(). */
+	if ((aux == VDEV_AUX_EXTERNAL || aux == VDEV_AUX_EXTERNAL_PERSIST) &&
+	    vdev_async_mirror_is_child(vd)) {
+		return (spa_vdev_state_exit(spa, NULL,
+		    ZFS_ERR_ASYNC_MIRROR_ACTIVE));
+	}
+
 	/*
 	 * If user did a 'zpool offline -f' then make the fault persist across
 	 * reboots.
@@ -4853,6 +4879,11 @@ top:
 
 	if (vd->vdev_ops == &vdev_draid_spare_ops)
 		return (spa_vdev_state_exit(spa, NULL, ENOTSUP));
+
+	if (vdev_async_mirror_is_child(vd)) {
+		return (spa_vdev_state_exit(spa, NULL,
+		    ZFS_ERR_ASYNC_MIRROR_ACTIVE));
+	}
 
 	tvd = vd->vdev_top;
 	mg = tvd->vdev_mg;
@@ -6378,6 +6409,9 @@ vdev_props_set_sync(void *arg, dmu_tx_t *tx)
 			    bias_str != NULL ? bias_str : "none");
 			break;
 		}
+		case VDEV_PROP_ASYNC_MIRROR:
+			/* vdev_async_mirror_set() wrote it already. */
+			break;
 		default:
 			/* normalize the property name */
 			propname = vdev_prop_to_name(prop);
@@ -6640,6 +6674,31 @@ vdev_prop_set(spa_t *spa, nvlist_t *innvl, nvlist_t *outnvl)
 				break;
 			}
 			vd->vdev_scheduler = intval;
+			break;
+		case VDEV_PROP_ASYNC_MIRROR:
+			if (nvpair_value_uint64(elem, &intval) != 0 ||
+			    intval > VDEV_ASYNC_MIRROR_LAGGING) {
+				error = EINVAL;
+				break;
+			}
+			if (!vd->vdev_ops->vdev_op_leaf ||
+			    vd->vdev_leaf_zap == 0) {
+				error = ENOTSUP;
+				break;
+			}
+			error = vdev_async_mirror_set_check(spa, vd, intval);
+			if (error != 0)
+				break;
+			/*
+			 * The change waits for a txg; same locking dance as
+			 * VDEV_PROP_PATH above.
+			 */
+			spa_config_exit(spa, SCL_CONFIG, FTAG);
+			error = vdev_async_mirror_set(spa, vdev_guid, intval);
+			spa_config_enter(spa, SCL_CONFIG, FTAG, RW_READER);
+			vd = spa_lookup_by_guid(spa, vdev_guid, B_TRUE);
+			if (vd == NULL && error == 0)
+				error = SET_ERROR(ENODEV);
 			break;
 		case VDEV_PROP_ALLOC_BIAS:
 			if (nvpair_value_uint64(elem, &intval) != 0) {
@@ -7171,6 +7230,29 @@ vdev_prop_get(spa_t *spa, nvlist_t *innvl, nvlist_t *outnvl)
 			case VDEV_PROP_ROTATIONAL:
 				vdev_prop_add_list(outnvl, propname, NULL,
 				    !vd->vdev_nonrot, ZPROP_SRC_NONE);
+				continue;
+			case VDEV_PROP_ASYNC_MIRROR:
+				/* Only leaf vdevs can have this property */
+				if (!vd->vdev_ops->vdev_op_leaf)
+					continue;
+				err = vdev_prop_get_int(vd, prop, &intval);
+				if (err && err != ENOENT)
+					break;
+
+				if (intval == vdev_prop_default_numeric(prop))
+					src = ZPROP_SRC_DEFAULT;
+				else
+					src = ZPROP_SRC_LOCAL;
+
+				vdev_prop_add_list(outnvl, propname, NULL,
+				    intval, src);
+				break;
+			case VDEV_PROP_ASYNC_MIRROR_STATE:
+				if (vd->vdev_ops->vdev_op_leaf) {
+					vdev_prop_add_list(outnvl, propname,
+					    vdev_async_mirror_state(vd), 0,
+					    ZPROP_SRC_NONE);
+				}
 				continue;
 			case VDEV_PROP_CHECKSUM_N:
 			case VDEV_PROP_CHECKSUM_T:

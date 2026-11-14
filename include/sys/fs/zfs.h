@@ -479,6 +479,8 @@ typedef enum {
 	VDEV_PROP_ANYRAID_CAP_TILES,
 	VDEV_PROP_ANYRAID_NUM_TILES,
 	VDEV_PROP_ANYRAID_TILE_SIZE,
+	VDEV_PROP_ASYNC_MIRROR,
+	VDEV_PROP_ASYNC_MIRROR_STATE,
 	VDEV_NUM_PROPS
 } vdev_prop_t;
 
@@ -503,6 +505,16 @@ typedef enum vdev_alloc_bias {
 	VDEV_BIAS_SPECIAL,	/* dedicated to ddt, metadata, and small blks */
 	VDEV_BIAS_DEDUP		/* dedicated to dedup metadata */
 } vdev_alloc_bias_t;
+
+/*
+ * Values of the async_mirror property of a leaf vdev.  The leaf named
+ * lagging is the lagging child of an asynchronous mirror; see
+ * module/zfs/vdev_async_mirror.c.
+ */
+typedef enum vdev_async_mirror_prop {
+	VDEV_ASYNC_MIRROR_OFF,
+	VDEV_ASYNC_MIRROR_LAGGING
+} vdev_async_mirror_prop_t;
 
 /*
  * Dataset property functions shared between libzfs and kernel.
@@ -963,6 +975,14 @@ typedef struct zpool_load_policy {
 #define	ZPOOL_CONFIG_REMOVING		"removing"
 #define	ZPOOL_CONFIG_RESILVER_TXG	"resilver_txg"
 #define	ZPOOL_CONFIG_REBUILD_TXG	"rebuild_txg"
+#define	ZPOOL_CONFIG_ASYNC_MIRROR_LAGGING	"async_mirror_lagging"
+#define	ZPOOL_CONFIG_ASYNC_MIRROR_LINEAGE	"async_mirror_lineage"
+#define	ZPOOL_CONFIG_ASYNC_MIRROR_DIVERGED	"async_mirror_diverged"
+#define	ZPOOL_CONFIG_ASYNC_MIRROR_STATS		"async_mirror_stats"
+#define	ZPOOL_CONFIG_ASYNC_MIRROR_APPLIED_TXG	"applied_txg"
+#define	ZPOOL_CONFIG_ASYNC_MIRROR_SYNCED_TXG	"synced_txg"
+#define	ZPOOL_CONFIG_ASYNC_MIRROR_PENDING	"pending_bytes"
+						/* not stored on disk */
 #define	ZPOOL_CONFIG_COMMENT		"comment"
 #define	ZPOOL_CONFIG_SUSPENDED		"suspended"	/* not stored on disk */
 #define	ZPOOL_CONFIG_SUSPENDED_REASON	"suspended_reason"	/* not stored */
@@ -1020,6 +1040,8 @@ typedef struct zpool_load_policy {
 #define	ZPOOL_LOAD_RELAX_META		"load-relax-meta"
 #define	ZPOOL_LOAD_META_THRESH		"load-meta-thresh"
 #define	ZPOOL_LOAD_DATA_THRESH		"load-data-thresh"
+/* Guid of the copy of an asynchronous mirror to keep, the other discarded */
+#define	ZPOOL_LOAD_ASYNC_MIRROR_KEEP	"load-async-mirror-keep"
 
 /* Rewind data discovered */
 #define	ZPOOL_CONFIG_LOAD_TXG		"rewind_txg"
@@ -1112,6 +1134,10 @@ typedef struct zpool_load_policy {
 	"org.zfsonlinux:vdev_trim_partial"
 #define	VDEV_LEAF_ZAP_TRIM_SECURE	\
 	"org.zfsonlinux:vdev_trim_secure"
+
+/* asynchronous mirror: the lineage that the pool wrote to the labels */
+#define	VDEV_LEAF_ZAP_ASYNC_MIRROR_LINEAGE	\
+	"org.openzfs:async_mirror_label_lineage"
 
 /*
  * This is needed in userland to report the minimum necessary device size.
@@ -1834,6 +1860,8 @@ typedef enum {
 	ZFS_ERR_NO_USER_NS_SUPPORT,
 	ZFS_ERR_CRYPTO_KEY_MISMATCH,
 	ZFS_ERR_RAIDZ_EXPAND_TOO_WIDE,
+	ZFS_ERR_ASYNC_MIRROR_ACTIVE,
+	ZFS_ERR_ASYNC_MIRROR_DIVERGED,
 } zfs_errno_t;
 
 /*
@@ -2094,6 +2122,29 @@ typedef enum {
  *		ZFS_EV_HIST_DSNAME	DATA_TYPE_STRING	(optional)
  *		ZFS_EV_HIST_DSID	DATA_TYPE_UINT64	(optional)
  *
+ *	ESC_ZFS_ASYNC_MIRROR_RETRY
+ *
+ *		ZFS_EV_POOL_NAME	DATA_TYPE_STRING
+ *		ZFS_EV_POOL_GUID	DATA_TYPE_UINT64
+ *		ZFS_EV_VDEV_PATH	DATA_TYPE_STRING	(optional)
+ *		ZFS_EV_VDEV_GUID	DATA_TYPE_UINT64
+ *		ZFS_EV_ASYNC_MIRROR_TXG	DATA_TYPE_UINT64
+ *		ZFS_EV_ASYNC_MIRROR_ERRNO	DATA_TYPE_INT32
+ *		ZFS_EV_ASYNC_MIRROR_RETRIES	DATA_TYPE_UINT64
+ *		ZFS_EV_ASYNC_MIRROR_DELAY_MS	DATA_TYPE_UINT64
+ *
+ *	ESC_ZFS_ASYNC_MIRROR_RECOVERED
+ *
+ *		ZFS_EV_POOL_NAME	DATA_TYPE_STRING
+ *		ZFS_EV_POOL_GUID	DATA_TYPE_UINT64
+ *		ZFS_EV_VDEV_PATH	DATA_TYPE_STRING	(optional)
+ *		ZFS_EV_VDEV_GUID	DATA_TYPE_UINT64
+ *		ZFS_EV_ASYNC_MIRROR_TXG	DATA_TYPE_UINT64
+ *		ZFS_EV_ASYNC_MIRROR_OBJSET	DATA_TYPE_UINT64
+ *		ZFS_EV_ASYNC_MIRROR_OBJECT	DATA_TYPE_UINT64
+ *		ZFS_EV_ASYNC_MIRROR_LEVEL	DATA_TYPE_INT64
+ *		ZFS_EV_ASYNC_MIRROR_BLKID	DATA_TYPE_UINT64
+ *
  * The ZFS_EV_HIST_* members will correspond to the ZPOOL_HIST_* members in the
  * history log nvlist.  The keynames will be free of any spaces or other
  * characters that could be potentially unexpected to consumers of the
@@ -2116,6 +2167,14 @@ typedef enum {
 #define	ZFS_EV_HIST_DSNAME	"history_dsname"
 #define	ZFS_EV_HIST_DSID	"history_dsid"
 #define	ZFS_EV_RESILVER_TYPE	"resilver_type"
+#define	ZFS_EV_ASYNC_MIRROR_TXG		"async_mirror_txg"
+#define	ZFS_EV_ASYNC_MIRROR_ERRNO	"async_mirror_errno"
+#define	ZFS_EV_ASYNC_MIRROR_RETRIES	"async_mirror_retries"
+#define	ZFS_EV_ASYNC_MIRROR_DELAY_MS	"async_mirror_delay_ms"
+#define	ZFS_EV_ASYNC_MIRROR_OBJSET	"async_mirror_objset"
+#define	ZFS_EV_ASYNC_MIRROR_OBJECT	"async_mirror_object"
+#define	ZFS_EV_ASYNC_MIRROR_LEVEL	"async_mirror_level"
+#define	ZFS_EV_ASYNC_MIRROR_BLKID	"async_mirror_blkid"
 
 /*
  * We currently support block sizes from 512 bytes to 16MB.

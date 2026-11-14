@@ -954,6 +954,27 @@ typedef struct spa_history_list {
 	procfs_list_t		procfs_list;
 } spa_history_list_t;
 
+typedef struct spa_async_mirror_stats {
+	uint64_t	sams_active;
+	uint64_t	sams_failed;
+	uint64_t	sams_applied_txg;
+	uint64_t	sams_synced_txg;
+	uint64_t	sams_pending_bytes;
+	uint64_t	sams_pending_txgs;
+	uint64_t	sams_held_bytes;
+	uint64_t	sams_copied_bytes;
+	uint64_t	sams_last_lag_ms;
+	uint64_t	sams_max_lag_ms;
+	uint64_t	sams_throttled_ms;
+	uint64_t	sams_resync_from;
+	uint64_t	sams_data_errors;
+	uint64_t	sams_read_retries;
+	uint64_t	sams_frozen;
+	uint64_t	sams_frozen_txg;
+	uint64_t	sams_data_deferred;
+	uint64_t	sams_data_recovered;
+} spa_async_mirror_stats_t;
+
 typedef struct spa_stats {
 	spa_history_list_t	read_history;
 	spa_history_list_t	txg_history;
@@ -964,6 +985,7 @@ typedef struct spa_stats {
 	spa_history_kstat_t	iostats;
 	spa_history_kstat_t	log_spacemaps;
 	spa_history_kstat_t	misc;
+	spa_history_kstat_t	async_mirror;
 } spa_stats_t;
 
 typedef enum txg_state {
@@ -1086,6 +1108,9 @@ extern void spa_log_sm_stats_update(spa_t *spa);
 extern void spa_misc_stats_bump_suspended_ioerr(spa_t *spa);
 extern void spa_misc_stats_bump_suspended_mmp(spa_t *spa);
 extern void spa_misc_stats_bump_resumed(spa_t *spa);
+extern void spa_async_mirror_stats_init(spa_t *spa);
+extern void spa_async_mirror_stats_update(spa_t *spa);
+extern void spa_async_mirror_stats_destroy(spa_t *spa);
 
 /* Log claim callback */
 extern void spa_claim_notify(zio_t *zio);

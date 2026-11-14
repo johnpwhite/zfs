@@ -1194,6 +1194,134 @@ spa_misc_stats_destroy(spa_t *spa)
 	mutex_destroy(&shk->lock);
 }
 
+/*
+ * Async mirror stats.
+ */
+typedef struct spa_async_mirror_kstat {
+	kstat_named_t	active;
+	kstat_named_t	failed;
+	kstat_named_t	applied_txg;
+	kstat_named_t	synced_txg;
+	kstat_named_t	pending_bytes;
+	kstat_named_t	pending_txgs;
+	kstat_named_t	held_bytes;
+	kstat_named_t	copied_bytes;
+	kstat_named_t	last_lag_ms;
+	kstat_named_t	max_lag_ms;
+	kstat_named_t	throttled_ms;
+	kstat_named_t	resync_from;
+	kstat_named_t	data_errors;
+	kstat_named_t	read_retries;
+	kstat_named_t	frozen;
+	kstat_named_t	frozen_txg;
+	kstat_named_t	data_deferred;
+	kstat_named_t	data_recovered;
+} spa_async_mirror_kstat_t;
+
+static spa_async_mirror_kstat_t spa_async_mirror_kstat_template = {
+	{ "active",		KSTAT_DATA_UINT64 },
+	{ "failed",		KSTAT_DATA_UINT64 },
+	{ "applied_txg",	KSTAT_DATA_UINT64 },
+	{ "synced_txg",		KSTAT_DATA_UINT64 },
+	{ "pending_bytes",	KSTAT_DATA_UINT64 },
+	{ "pending_txgs",	KSTAT_DATA_UINT64 },
+	{ "held_bytes",		KSTAT_DATA_UINT64 },
+	{ "copied_bytes",	KSTAT_DATA_UINT64 },
+	{ "last_lag_ms",	KSTAT_DATA_UINT64 },
+	{ "max_lag_ms",		KSTAT_DATA_UINT64 },
+	{ "throttled_ms",	KSTAT_DATA_UINT64 },
+	{ "resync_from",	KSTAT_DATA_UINT64 },
+	{ "data_errors",	KSTAT_DATA_UINT64 },
+	{ "read_retries",	KSTAT_DATA_UINT64 },
+	{ "frozen",		KSTAT_DATA_UINT64 },
+	{ "frozen_txg",		KSTAT_DATA_UINT64 },
+	{ "data_deferred",	KSTAT_DATA_UINT64 },
+	{ "data_recovered",	KSTAT_DATA_UINT64 }
+};
+
+#define	SPA_ASYNC_MIRROR_STATS_SET(stat) \
+    atomic_store_64(&am_stats->stat.value.ui64, sams->sams_##stat)
+
+void
+spa_async_mirror_stats_update(spa_t *spa)
+{
+	spa_history_kstat_t *shk = &spa->spa_stats.async_mirror;
+	kstat_t *ksp = shk->kstat;
+
+	if (ksp == NULL)
+		return;
+
+	spa_async_mirror_kstat_t *am_stats = ksp->ks_data;
+	spa_async_mirror_stats_t *sams = &spa->spa_async_mirror_stats;
+
+	SPA_ASYNC_MIRROR_STATS_SET(active);
+	SPA_ASYNC_MIRROR_STATS_SET(failed);
+	SPA_ASYNC_MIRROR_STATS_SET(applied_txg);
+	SPA_ASYNC_MIRROR_STATS_SET(synced_txg);
+	SPA_ASYNC_MIRROR_STATS_SET(pending_bytes);
+	SPA_ASYNC_MIRROR_STATS_SET(pending_txgs);
+	SPA_ASYNC_MIRROR_STATS_SET(held_bytes);
+	SPA_ASYNC_MIRROR_STATS_SET(copied_bytes);
+	SPA_ASYNC_MIRROR_STATS_SET(last_lag_ms);
+	SPA_ASYNC_MIRROR_STATS_SET(max_lag_ms);
+	SPA_ASYNC_MIRROR_STATS_SET(throttled_ms);
+	SPA_ASYNC_MIRROR_STATS_SET(resync_from);
+	SPA_ASYNC_MIRROR_STATS_SET(data_errors);
+	SPA_ASYNC_MIRROR_STATS_SET(read_retries);
+	SPA_ASYNC_MIRROR_STATS_SET(frozen);
+	SPA_ASYNC_MIRROR_STATS_SET(frozen_txg);
+	SPA_ASYNC_MIRROR_STATS_SET(data_deferred);
+	SPA_ASYNC_MIRROR_STATS_SET(data_recovered);
+}
+
+/*
+ * The async_mirror kstat exists only while the pool has the state of an
+ * asynchronous mirror: vdev_async_mirror.c creates it before it publishes
+ * the state, and destroys it when it frees the state.
+ */
+void
+spa_async_mirror_stats_init(spa_t *spa)
+{
+	spa_history_kstat_t *shk = &spa->spa_stats.async_mirror;
+
+	ASSERT0P(shk->kstat);
+	mutex_init(&shk->lock, NULL, MUTEX_DEFAULT, NULL);
+
+	char *name = kmem_asprintf("zfs/%s", spa_name(spa));
+	kstat_t *ksp = kstat_create(name, 0, "async_mirror", "misc",
+	    KSTAT_TYPE_NAMED,
+	    sizeof (spa_async_mirror_kstat_t) / sizeof (kstat_named_t),
+	    KSTAT_FLAG_VIRTUAL);
+
+	shk->kstat = ksp;
+	if (ksp) {
+		ksp->ks_lock = &shk->lock;
+		ksp->ks_data =
+		    kmem_alloc(sizeof (spa_async_mirror_kstat_t), KM_SLEEP);
+		memcpy(ksp->ks_data, &spa_async_mirror_kstat_template,
+		    sizeof (spa_async_mirror_kstat_t));
+		kstat_install(ksp);
+	}
+
+	kmem_strfree(name);
+	spa_async_mirror_stats_update(spa);
+}
+
+void
+spa_async_mirror_stats_destroy(spa_t *spa)
+{
+	spa_history_kstat_t *shk = &spa->spa_stats.async_mirror;
+	kstat_t *ksp = shk->kstat;
+
+	if (ksp) {
+		shk->kstat = NULL;
+		kmem_free(ksp->ks_data, sizeof (spa_async_mirror_kstat_t));
+		kstat_delete(ksp);
+	}
+
+	mutex_destroy(&shk->lock);
+}
+
 void
 spa_stats_init(spa_t *spa)
 {

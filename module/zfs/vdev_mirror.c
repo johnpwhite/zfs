@@ -30,6 +30,7 @@
 #include <sys/abd.h>
 #include <sys/fs/zfs.h>
 #include <sys/vdev_mirror.h>
+#include <sys/vdev_async_mirror.h>
 
 /*
  * Vdev mirror kstats
@@ -477,6 +478,29 @@ vdev_mirror_child_readable(mirror_child_t *mc)
 		return (vdev_readable(vd));
 }
 
+/*
+ * True if a read must not use this child of an async mirror, not even
+ * as the last resort: it is a lagging child that can hold older data at the
+ * block's offset, which would pass without a checksum.  The fence is not an
+ * error of the child, so it is speculative: the error of a child that was
+ * read must not be hidden.  A pool without the async mirror pays one test here.
+ */
+static boolean_t
+vdev_mirror_child_fenced(mirror_child_t *mc, const zio_t *zio)
+{
+	if (zio->io_spa->spa_async_mirror == NULL &&
+	    !mc->mc_vd->vdev_async_lagging)
+		return (B_FALSE);
+	if (!vdev_async_mirror_read_fenced(mc->mc_vd, zio))
+		return (B_FALSE);
+
+	mc->mc_error = SET_ERROR(ENXIO);
+	mc->mc_tried = 1;
+	mc->mc_skipped = 1;
+	mc->mc_speculative = 1;
+	return (B_TRUE);
+}
+
 static boolean_t
 vdev_mirror_child_missing(mirror_child_t *mc, uint64_t txg, uint64_t size)
 {
@@ -527,6 +551,7 @@ vdev_mirror_child_select(zio_t *zio)
 	uint64_t txg = zio->io_txg;
 	boolean_t rebuild = (zio->io_priority == ZIO_PRIORITY_REBUILD);
 	int incomplete = -1;
+	int lagging = -1;
 	int c, lowest_load;
 
 	ASSERT(zio->io_bp == NULL || BP_GET_PHYSICAL_BIRTH(zio->io_bp) == txg);
@@ -548,10 +573,24 @@ vdev_mirror_child_select(zio_t *zio)
 			continue;
 		}
 
+		if (vdev_mirror_child_fenced(mc, zio))
+			continue;
+
 		if (vdev_mirror_child_missing(mc, txg, 1)) {
 			mc->mc_error = SET_ERROR(ESTALE);
 			mc->mc_skipped = 1;
 			mc->mc_speculative = 1;
+			continue;
+		}
+
+		/*
+		 * A lagging child of an async mirror holds the blocks
+		 * born up to its txg.  Read such a block from it only if no
+		 * other child can.
+		 */
+		if (mc->mc_vd->vdev_async_lagging) {
+			if (lagging == -1)
+				lagging = c;
 			continue;
 		}
 
@@ -592,6 +631,9 @@ vdev_mirror_child_select(zio_t *zio)
 
 	if (incomplete != -1)
 		return (incomplete);
+
+	if (lagging != -1)
+		return (lagging);
 
 	/*
 	 * Every device is either missing or has this txg in its DTL.
@@ -638,6 +680,8 @@ vdev_mirror_io_start_impl(zio_t *zio, mirror_map_t *mm)
 					mc->mc_skipped = 1;
 					continue;
 				}
+				if (vdev_mirror_child_fenced(mc, zio))
+					continue;
 
 				mc->mc_abd = first ? zio->io_abd :
 				    abd_alloc_sametype(zio->io_abd,
@@ -687,6 +731,12 @@ vdev_mirror_io_start_impl(zio_t *zio, mirror_map_t *mm)
 		    mm->mm_rebuilding && !mc->mc_rebuilding) {
 			continue;
 		}
+
+		/* Replayed later, in txg order, by vdev_async_mirror.c. */
+		if (zio->io_type == ZIO_TYPE_WRITE &&
+		    zio->io_spa->spa_async_mirror != NULL &&
+		    vdev_async_mirror_intercept_write(zio, mc->mc_vd))
+			continue;
 
 		zio_nowait(zio_vdev_child_io(zio, zio->io_bp,
 		    mc->mc_vd, mc->mc_offset, zio->io_abd, zio->io_size,
@@ -917,6 +967,12 @@ vdev_mirror_io_done(zio_t *zio)
 			 * there would be no good copies left!
 			 */
 			mc = &mm->mm_child[c];
+
+			/* A lagging child may not hold this block yet. */
+			if ((zio->io_spa->spa_async_mirror != NULL ||
+			    mc->mc_vd->vdev_async_lagging) &&
+			    vdev_async_mirror_no_repair(mc->mc_vd, zio))
+				continue;
 
 			if (mc->mc_error == 0) {
 				vdev_ops_t *ops = mc->mc_vd->vdev_ops;

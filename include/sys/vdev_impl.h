@@ -391,6 +391,11 @@ struct vdev {
 	uint64_t	vdev_removed;	/* persistent removed state	*/
 	uint64_t	vdev_resilver_txg; /* persistent resilvering state */
 	uint64_t	vdev_rebuild_txg; /* persistent rebuilding state */
+	uint64_t	vdev_async_lagging; /* persistent: lags its mirror */
+	uint64_t	vdev_async_txg;	/* it holds the blocks up to this */
+	uint64_t	vdev_async_mirror; /* the async_mirror property */
+	uint64_t	vdev_async_label_lineage; /* lineage in its labels */
+	uint32_t	vdev_async_state; /* async mirror state, atomic */
 	char		*vdev_path;	/* vdev path (if any)		*/
 	char		*vdev_devid;	/* vdev devid (if any)		*/
 	char		*vdev_physpath;	/* vdev device path (if any)	*/

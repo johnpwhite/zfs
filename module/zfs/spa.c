@@ -60,6 +60,7 @@
 #include <sys/vdev_raidz.h>
 #include <sys/vdev_draid.h>
 #include <sys/vdev_anyraid.h>
+#include <sys/vdev_async_mirror.h>
 #include <sys/metaslab.h>
 #include <sys/metaslab_impl.h>
 #include <sys/mmp.h>
@@ -815,6 +816,12 @@ spa_prop_validate(spa_t *spa, nvlist_t *props)
 			if (!error && intval > 1)
 				error = SET_ERROR(EINVAL);
 
+			/* MMP writes uberblocks to the lagging child. */
+			if (!error && intval != 0 &&
+			    vdev_async_mirror_active(spa)) {
+				error = SET_ERROR(ZFS_ERR_ASYNC_MIRROR_ACTIVE);
+			}
+
 			if (!error) {
 				uint32_t hostid = zone_get_hostid(NULL);
 				if (hostid)
@@ -1069,6 +1076,10 @@ spa_change_guid_check(void *arg, dmu_tx_t *tx)
 		    ZFS_ERR_CHECKPOINT_EXISTS : ZFS_ERR_DISCARDING_CHECKPOINT;
 		return (SET_ERROR(error));
 	}
+
+	/* The labels of the lagging child would keep the old pool guid. */
+	if (vdev_async_mirror_active(spa))
+		return (SET_ERROR(ZFS_ERR_ASYNC_MIRROR_ACTIVE));
 
 	spa_config_enter(spa, SCL_STATE, FTAG, RW_READER);
 	vdev_state = rvd->vdev_state;
@@ -2373,6 +2384,7 @@ spa_unload(spa_t *spa)
 		txg_sync_stop(spa->spa_dsl_pool);
 		spa->spa_sync_on = B_FALSE;
 	}
+	vdev_async_mirror_stop(spa);
 
 	/*
 	 * This ensures that there is no async metaslab prefetching
@@ -2392,6 +2404,8 @@ spa_unload(spa_t *spa)
 		kmem_free(spa->spa_async_zio_root, max_ncpus * sizeof (void *));
 		spa->spa_async_zio_root = NULL;
 	}
+
+	vdev_async_mirror_fini(spa);
 
 	if (spa->spa_vdev_removal != NULL) {
 		spa_vdev_removal_destroy(spa->spa_vdev_removal);
@@ -3685,6 +3699,8 @@ spa_spawn_aux_threads(spa_t *spa)
 	    zthr_create("z_checkpoint_discard",
 	    spa_checkpoint_discard_thread_check,
 	    spa_checkpoint_discard_thread, spa, minclsyspri);
+
+	vdev_async_mirror_spawn(spa);
 }
 
 /*
@@ -5209,6 +5225,9 @@ spa_ld_trusted_config(spa_t *spa, spa_import_type_t type,
 	if (error != 0)
 		return (error);
 
+	/* The new vdev tree has new vdevs; read their txgs again. */
+	vdev_async_mirror_load_marked(spa);
+
 	if (copy_error != 0 || spa_load_print_vdev_tree) {
 		spa_load_note(spa, "final vdev tree:");
 		vdev_dbgmsg_print_tree(rvd, 2);
@@ -6000,6 +6019,13 @@ spa_ld_mos_init(spa_t *spa, spa_import_type_t type)
 		return (error);
 
 	/*
+	 * Before the first read of metadata, find the txg of each lagging
+	 * child of an asynchronous mirror, so that newer blocks are not read
+	 * from it.
+	 */
+	vdev_async_mirror_load_marked(spa);
+
+	/*
 	 * Pass that uberblock to the dsl_pool layer which will open the root
 	 * blkptr. This blkptr points to the latest version of the MOS and will
 	 * allow us to read its contents.
@@ -6173,6 +6199,33 @@ spa_load_impl(spa_t *spa, spa_import_type_t type, const char **ereport)
 	error = spa_ld_mos_with_trusted_config(spa, type, &update_config_cache);
 	if (error != 0)
 		return (error);
+
+	/*
+	 * Refuse a load that may write the two copies of an asynchronous
+	 * mirror that were written separately.  Nothing is written yet.
+	 * When the operator chose the copy to keep, the check erases the
+	 * uberblocks of the other copy and asks for the load to start
+	 * again, so that the kept copy's uberblock is the selected one.
+	 */
+	error = vdev_async_mirror_check_lineage(spa);
+	if (error == ERESTART) {
+		update_config_cache = B_TRUE;
+		spa_ld_prepare_for_reload(spa);
+		spa_load_note(spa, "RELOADING with the kept copy of the "
+		    "asynchronous mirror");
+		error = spa_ld_mos_with_trusted_config(spa, type, NULL);
+		if (error != 0)
+			return (error);
+		error = vdev_async_mirror_check_lineage(spa);
+		if (error == ERESTART)
+			error = SET_ERROR(ZFS_ERR_ASYNC_MIRROR_DIVERGED);
+	}
+	if (error != 0) {
+		spa_load_failed(spa, "the copies of the asynchronous mirror "
+		    "were written separately, or cannot be checked "
+		    "[error=%d]", error);
+		return (error);
+	}
 
 	/*
 	 * If we are rewinding to the checkpoint then we need to repeat
@@ -6359,11 +6412,28 @@ spa_load_impl(spa_t *spa, spa_import_type_t type, const char **ereport)
 			    (u_longlong_t)spa->spa_uberblock.ub_checkpoint_txg);
 		}
 
+		/*
+		 * Find the asynchronous mirror child before the claims, so
+		 * that the claims can see which blocks to keep off it.  A pool
+		 * without the feature has no records, no lineage and no leaf
+		 * that asks for the mode.
+		 */
+		error = spa_feature_is_enabled(spa, SPA_FEATURE_ASYNC_MIRROR) ?
+		    vdev_async_mirror_activate(spa) : 0;
+		if (error != 0) {
+			spa_load_failed(spa, "cannot read the async mirror "
+			    "records [error=%d]", error);
+			error = spa_vdev_err(spa->spa_root_vdev,
+			    VDEV_AUX_CORRUPT_DATA, EIO);
+			goto fail;
+		}
+
 		spa_import_progress_set_notes(spa, "Claiming ZIL blocks");
 		/*
 		 * Traverse the ZIL and claim all blocks.
 		 */
 		spa_ld_claim_log_blocks(spa);
+		vdev_async_mirror_claimed(spa);
 
 		/*
 		 * Kick-off the syncing thread.
@@ -6557,6 +6627,9 @@ spa_load_best(spa_t *spa, spa_load_state_t state, uint64_t max_request,
 		zfs_fallthrough;
 	case EBADF:
 		/* The config cache is out of sync (vdevs or hostid) */
+		zfs_fallthrough;
+	case ZFS_ERR_ASYNC_MIRROR_DIVERGED:
+		/* An older txg does not join the copies of the mirror */
 		zfs_fallthrough;
 	case EINTR:
 		/* The user interactively interrupted the import */
@@ -7694,6 +7767,15 @@ spa_import(char *pool, nvlist_t *config, nvlist_t *props, uint64_t flags)
 	if (policy.zlp_rewind & ZPOOL_DO_REWIND)
 		state = SPA_LOAD_RECOVER;
 
+	/* The copy of an asynchronous mirror that the operator keeps. */
+	nvlist_t *nvpolicy;
+
+	if (nvlist_lookup_nvlist(config, ZPOOL_LOAD_POLICY, &nvpolicy) == 0) {
+		(void) nvlist_lookup_uint64(nvpolicy,
+		    ZPOOL_LOAD_ASYNC_MIRROR_KEEP,
+		    &spa->spa_async_mirror_import.ami_keep);
+	}
+
 	spa->spa_config_source = SPA_CONFIG_SRC_TRYIMPORT;
 
 	if (state != SPA_LOAD_RECOVER) {
@@ -7704,6 +7786,8 @@ spa_import(char *pool, nvlist_t *config, nvlist_t *props, uint64_t flags)
 		    "(RECOVERY MODE)", pool, (longlong_t)policy.zlp_txg);
 	}
 	error = spa_load_best(spa, state, policy.zlp_txg, policy.zlp_rewind);
+	/* The choice is for this import only, not for a later load. */
+	spa->spa_async_mirror_import.ami_keep = 0;
 
 	/*
 	 * Propagate anything learned while loading the pool and pass it
@@ -8279,6 +8363,15 @@ spa_vdev_add(spa_t *spa, nvlist_t *nvroot, boolean_t check_ashift)
 	if (vd->vdev_children == 0 && nspares == 0 && nl2cache == 0)
 		return (spa_vdev_exit(spa, vd, txg, EINVAL));
 
+	if (vdev_async_mirror_active(spa)) {
+		for (uint64_t c = 0; c < vd->vdev_children; c++) {
+			if (!vd->vdev_child[c]->vdev_islog) {
+				return (spa_vdev_exit(spa, vd, txg,
+				    ZFS_ERR_ASYNC_MIRROR_ACTIVE));
+			}
+		}
+	}
+
 	if (vd->vdev_children != 0 &&
 	    (error = vdev_create(vd, txg, B_FALSE)) != 0) {
 		return (spa_vdev_exit(spa, vd, txg, error));
@@ -8588,6 +8681,11 @@ spa_vdev_attach(spa_t *spa, uint64_t guid, nvlist_t *nvroot, int replacing,
 
 	if (oldvd == NULL)
 		return (spa_vdev_exit(spa, NULL, txg, ENODEV));
+
+	if (vdev_async_mirror_is_child(oldvd)) {
+		return (spa_vdev_exit(spa, NULL, txg,
+		    ZFS_ERR_ASYNC_MIRROR_ACTIVE));
+	}
 
 	boolean_t raidz = oldvd->vdev_ops == &vdev_raidz_ops;
 	boolean_t anyraid = oldvd->vdev_ops == &vdev_anyraid_ops;
@@ -9002,6 +9100,11 @@ spa_vdev_detach(spa_t *spa, uint64_t guid, uint64_t pguid, int replace_done)
 	if (!vd->vdev_ops->vdev_op_leaf)
 		return (spa_vdev_exit(spa, NULL, txg, ENOTSUP));
 
+	if (vdev_async_mirror_is_child(vd)) {
+		return (spa_vdev_exit(spa, NULL, txg,
+		    ZFS_ERR_ASYNC_MIRROR_ACTIVE));
+	}
+
 	pvd = vd->vdev_parent;
 
 	/*
@@ -9238,6 +9341,10 @@ spa_vdev_initialize_impl(spa_t *spa, uint64_t guid, uint64_t cmd_type,
 	} else if (!vdev_writeable(vd)) {
 		spa_config_exit(spa, SCL_CONFIG | SCL_STATE, FTAG);
 		return (SET_ERROR(EROFS));
+	} else if (vdev_async_mirror_is_async(vd)) {
+		/* See the same refusal in spa_vdev_trim_impl(). */
+		spa_config_exit(spa, SCL_CONFIG | SCL_STATE, FTAG);
+		return (SET_ERROR(EOPNOTSUPP));
 	}
 	mutex_enter(&vd->vdev_initialize_lock);
 	spa_config_exit(spa, SCL_CONFIG | SCL_STATE, FTAG);
@@ -9356,7 +9463,11 @@ spa_vdev_trim_impl(spa_t *spa, uint64_t guid, uint64_t cmd_type,
 	} else if (!vdev_writeable(vd)) {
 		spa_config_exit(spa, SCL_CONFIG | SCL_STATE, FTAG);
 		return (SET_ERROR(EROFS));
-	} else if (!vd->vdev_has_trim) {
+	} else if (!vd->vdev_has_trim || vdev_async_mirror_is_async(vd)) {
+		/*
+		 * Free space on the leader is not free on the asynchronous
+		 * child: its older uberblock can still reference it.
+		 */
 		spa_config_exit(spa, SCL_CONFIG | SCL_STATE, FTAG);
 		return (SET_ERROR(EOPNOTSUPP));
 	} else if (secure && !vd->vdev_has_securetrim) {
@@ -9526,6 +9637,11 @@ spa_vdev_split_mirror(spa_t *spa, const char *newname, nvlist_t *config,
 		error = (spa_has_checkpoint(spa)) ?
 		    ZFS_ERR_CHECKPOINT_EXISTS : ZFS_ERR_DISCARDING_CHECKPOINT;
 		return (spa_vdev_exit(spa, NULL, txg, error));
+	}
+
+	if (vdev_async_mirror_active(spa)) {
+		return (spa_vdev_exit(spa, NULL, txg,
+		    ZFS_ERR_ASYNC_MIRROR_ACTIVE));
 	}
 
 	/* clear the log and flush everything up to now */
@@ -10431,6 +10547,8 @@ spa_async_suspend(spa_t *spa)
 	if (discard_thread != NULL)
 		zthr_cancel(discard_thread);
 
+	vdev_async_mirror_zthr_cancel(spa);
+
 	zthr_t *ll_delete_thread = spa->spa_livelist_delete_zthr;
 	if (ll_delete_thread != NULL)
 		zthr_cancel(ll_delete_thread);
@@ -10460,6 +10578,8 @@ spa_async_resume(spa_t *spa)
 	zthr_t *discard_thread = spa->spa_checkpoint_discard_zthr;
 	if (discard_thread != NULL)
 		zthr_resume(discard_thread);
+
+	vdev_async_mirror_zthr_resume(spa);
 
 	zthr_t *ll_delete_thread = spa->spa_livelist_delete_zthr;
 	if (ll_delete_thread != NULL)
@@ -11258,6 +11378,11 @@ spa_sync_iterate_to_convergence(spa_t *spa, dmu_tx_t *tx)
 			 * Sync tasks can only be processed in pass 1, so
 			 * there's no need to do this in later passes.
 			 */
+			/*
+			 * The lineage of an asynchronous mirror can dirty the
+			 * config, so that its labels are written in this txg.
+			 */
+			vdev_async_mirror_sync_lineage(spa, tx);
 			spa_sync_config_object(spa, tx);
 		}
 
@@ -11284,6 +11409,14 @@ spa_sync_iterate_to_convergence(spa_t *spa, dmu_tx_t *tx)
 			ASSERT(txg_list_empty(&dp->dp_early_sync_tasks, txg));
 			break;
 		}
+
+		/*
+		 * This txg will write an uberblock.  An asynchronous mirror
+		 * must have a record for it, even if no metaslab on the
+		 * mirror is dirty.  Creating it dirties the MOS, so the loop
+		 * runs another pass.
+		 */
+		vdev_async_mirror_sync_record(spa, tx);
 
 		spa_sync_deferred_frees(spa, tx);
 	} while (dmu_objset_is_dirty(mos, txg));
@@ -11466,6 +11599,12 @@ spa_sync(spa_t *spa, uint64_t txg)
 	dsl_pool_t *dp = spa->spa_dsl_pool;
 	dmu_tx_t *tx = dmu_tx_create_assigned(dp, txg);
 
+	/*
+	 * Turn an asynchronous mirror on or off, before this txg issues any
+	 * write or free.
+	 */
+	vdev_async_mirror_sync_start(spa, tx);
+
 	spa->spa_sync_starttime = getlrtime();
 
 	taskq_cancel_id(system_delay_taskq, spa->spa_deadman_tqid, B_TRUE);
@@ -11527,6 +11666,7 @@ spa_sync(spa_t *spa, uint64_t txg)
 		vdev_sync_dispatch(vd, txg);
 
 	spa_sync_rewrite_vdev_config(spa, tx);
+	vdev_async_mirror_txg_synced(spa, txg);
 	dmu_tx_commit(tx);
 
 	taskq_cancel_id(system_delay_taskq, spa->spa_deadman_tqid, B_TRUE);

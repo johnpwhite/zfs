@@ -146,6 +146,7 @@
 #include <sys/vdev_raidz.h>
 #include <sys/vdev_draid.h>
 #include <sys/vdev_anyraid.h>
+#include <sys/vdev_async_mirror.h>
 #include <sys/uberblock_impl.h>
 #include <sys/metaslab.h>
 #include <sys/metaslab_impl.h>
@@ -761,6 +762,9 @@ vdev_config_generate_impl(spa_t *spa, vdev_t *vd, nvlist_t *nv,
 		if (vd->vdev_rebuild_txg != 0)
 			fnvlist_add_uint64(nv, ZPOOL_CONFIG_REBUILD_TXG,
 			    vd->vdev_rebuild_txg);
+		if (vd->vdev_async_lagging)
+			fnvlist_add_uint64(nv,
+			    ZPOOL_CONFIG_ASYNC_MIRROR_LAGGING, B_TRUE);
 		if (vd->vdev_faulted)
 			fnvlist_add_uint64(nv, ZPOOL_CONFIG_FAULTED, B_TRUE);
 		if (vd->vdev_degraded)
@@ -1681,8 +1685,13 @@ vdev_uberblock_load_impl(zio_t *zio, vdev_t *vd, int flags,
 	for (int c = 0; c < vd->vdev_children; c++)
 		vdev_uberblock_load_impl(zio, vd->vdev_child[c], flags, cbp);
 
+	/*
+	 * The copy of an asynchronous mirror that the operator discards is
+	 * not a source of uberblocks; see async_mirror_keep_copy().
+	 */
 	if (vd->vdev_ops->vdev_op_leaf && vdev_readable(vd) &&
-	    vd->vdev_ops != &vdev_draid_spare_ops) {
+	    vd->vdev_ops != &vdev_draid_spare_ops &&
+	    vd->vdev_guid != vd->vdev_spa->spa_async_mirror_skip) {
 		int labels = VDEV_TRUSTED_LABELS(vd);
 
 		for (int l = 0; l < VDEV_LABELS; l++) {
@@ -1705,9 +1714,12 @@ vdev_uberblock_load_impl(zio_t *zio, vdev_t *vd, int flags,
  * configuration. First, we read the uberblock array of each label of each
  * vdev, keeping track of the uberblock with the highest txg in each array.
  * Then, we read the configuration from the same vdev as the best uberblock.
+ * If newest is not NULL, it gets the newest valid uberblock, whatever txg
+ * the load asked for.
  */
-void
-vdev_uberblock_load(vdev_t *rvd, uberblock_t *ub, nvlist_t **config)
+static void
+vdev_uberblock_load_common(vdev_t *rvd, uberblock_t *ub, uberblock_t *newest,
+    nvlist_t **config)
 {
 	zio_t *zio;
 	spa_t *spa = rvd->vdev_spa;
@@ -1742,6 +1754,8 @@ vdev_uberblock_load(vdev_t *rvd, uberblock_t *ub, nvlist_t **config)
 	 * prefer them.
 	 */
 	spa->spa_load_latest_ub_txg = cb.ubl_latest.ub_txg;
+	if (newest != NULL)
+		*newest = cb.ubl_latest;
 
 	if (cb.ubl_vd != NULL) {
 		vdev_dbgmsg(cb.ubl_vd, "best uberblock found for spa %s, "
@@ -1778,6 +1792,25 @@ vdev_uberblock_load(vdev_t *rvd, uberblock_t *ub, nvlist_t **config)
 		}
 	}
 	spa_config_exit(spa, SCL_ALL, FTAG);
+}
+
+void
+vdev_uberblock_load(vdev_t *rvd, uberblock_t *ub, nvlist_t **config)
+{
+	vdev_uberblock_load_common(rvd, ub, NULL, config);
+}
+
+/*
+ * As vdev_uberblock_load(), and also return the newest valid uberblock in
+ * the labels, with no filter on spa_load_max_txg.  A rewind can select an
+ * older uberblock while the labels still hold newer ones.
+ */
+void
+vdev_uberblock_load_newest(vdev_t *rvd, uberblock_t *best,
+    uberblock_t *newest, nvlist_t **config)
+{
+	ASSERT(newest);
+	vdev_uberblock_load_common(rvd, best, newest, config);
 }
 
 /*
@@ -1856,9 +1889,10 @@ vdev_uberblock_sync_done(zio_t *zio)
 
 /*
  * Write ub to its slot in the uberblock ring of each label of leaf vd.  Each
- * successful write increments *good_writes.
+ * successful write increments *good_writes.  The caller decides that this
+ * leaf gets the uberblock; see vdev_uberblock_sync().
  */
-static void
+void
 vdev_uberblock_write(zio_t *zio, uint64_t *good_writes, uberblock_t *ub,
     vdev_t *vd, int flags)
 {
@@ -1925,6 +1959,14 @@ vdev_uberblock_sync(zio_t *zio, uint64_t *good_writes,
 		return;
 
 	/*
+	 * The lagging child gets each uberblock after its txg is copied.  A log
+	 * device gets none while the lagging child holds an older txg.
+	 */
+	if (vd->vdev_spa->spa_async_mirror != NULL &&
+	    vdev_async_mirror_skip_uberblock(vd))
+		return;
+
+	/*
 	 * If the vdev was expanded, or its trailing labels were found to hold
 	 * an older pool's, the rings there have to be rebuilt in full: the
 	 * write below only lands in one slot of each, and every slot it does
@@ -1941,6 +1983,167 @@ vdev_uberblock_sync(zio_t *zio, uint64_t *good_writes,
 	}
 
 	vdev_uberblock_write(zio, good_writes, ub, vd, flags);
+}
+
+/*
+ * The state of one uberblock slot, as vdev_uberblock_erase() reads it: the
+ * txg of a valid uberblock, or one of these.
+ */
+#define	UB_ERASE_EMPTY		0		/* no valid uberblock */
+#define	UB_ERASE_UNREAD		UINT64_MAX	/* the read failed */
+
+static void
+vdev_uberblock_erase_read_done(zio_t *zio)
+{
+	uint64_t *state = zio->io_private;
+	uberblock_t *ub = abd_to_buf(zio->io_abd);
+
+	if (zio->io_error == 0) {
+		*state = (uberblock_verify(ub) == 0 && ub->ub_txg != 0) ?
+		    ub->ub_txg : UB_ERASE_EMPTY;
+	} else if (zio->io_error == ECKSUM) {
+		/* A slot that was never written.  The import skips it. */
+		*state = UB_ERASE_EMPTY;
+	} else {
+		*state = UB_ERASE_UNREAD;
+	}
+	abd_free(zio->io_abd);
+}
+
+/* Read the state of every uberblock slot of every label of a leaf. */
+static void
+vdev_uberblock_erase_read(vdev_t *vd, uint64_t *state, int flags)
+{
+	int count = VDEV_UBERBLOCK_COUNT(vd);
+	zio_t *zio = zio_root(vd->vdev_spa, NULL, NULL, flags);
+
+	for (int l = 0; l < VDEV_LABELS; l++) {
+		for (int n = 0; n < count; n++) {
+			state[l * count + n] = UB_ERASE_UNREAD;
+			vdev_label_read(zio, vd, l,
+			    abd_alloc_linear(VDEV_UBERBLOCK_SIZE(vd), B_TRUE),
+			    VDEV_UBERBLOCK_OFFSET(vd, n),
+			    VDEV_UBERBLOCK_SIZE(vd),
+			    vdev_uberblock_erase_read_done,
+			    &state[l * count + n],
+			    flags | ZIO_FLAG_SPECULATIVE);
+		}
+	}
+	(void) zio_wait(zio);
+}
+
+/*
+ * Write zeros to the slots that match, in every label, then flush.  A slot
+ * of zeros has a valid label checksum and no uberblock magic, so the import
+ * skips it.  Return the first error.
+ */
+static int
+vdev_uberblock_erase_write(vdev_t *vd, uint64_t *state, boolean_t phase1,
+    uint64_t max_txg, abd_t *zeros, int flags)
+{
+	int count = VDEV_UBERBLOCK_COUNT(vd);
+	zio_t *zio = zio_root(vd->vdev_spa, NULL, NULL, flags);
+
+	for (int l = 0; l < VDEV_LABELS; l++) {
+		for (int n = 0; n < count; n++) {
+			uint64_t s = state[l * count + n];
+
+			if (phase1 && (s == UB_ERASE_EMPTY ||
+			    s == UB_ERASE_UNREAD || s > max_txg))
+				continue;
+			if (!phase1 && s == UB_ERASE_EMPTY)
+				continue;
+			vdev_label_write(zio, vd, l, zeros,
+			    VDEV_UBERBLOCK_OFFSET(vd, n),
+			    VDEV_UBERBLOCK_SIZE(vd), NULL, NULL, flags);
+			state[l * count + n] = UB_ERASE_EMPTY;
+		}
+	}
+	int error = zio_wait(zio);
+
+	if (error == 0) {
+		zio = zio_root(vd->vdev_spa, NULL, NULL, flags);
+		zio_flush_leaf(zio, vd);
+		error = zio_wait(zio);
+	}
+	return (error);
+}
+
+/*
+ * Erase every uberblock in the labels of one leaf of an asynchronous
+ * mirror, at import, before the pool writes anything.  The import of a
+ * pool with the feature active calls this for a child whose uberblocks
+ * belong to a history that the import discards: a lagging child ahead of
+ * a rewind to txg max_txg, or the copy that the operator does not keep,
+ * whose uberblocks at or below max_txg look like points of the kept
+ * history.  The child is then resilvered in full.
+ *
+ * The erase runs in two flushed phases: first the slots at or below
+ * max_txg, then the others.  A crash in phase 1 leaves an uberblock above
+ * max_txg, so the next import again refuses the child or finds it ahead.
+ * A crash in phase 2 leaves only uberblocks above max_txg, or none.  So no
+ * crash can leave the child looking like an older copy of the selected
+ * txg.  That holds only if every slot was read: a slot that could not be
+ * read can hold a txg at or below max_txg, which phase 1 would not erase.
+ * So if any slot cannot be read, nothing is written.
+ *
+ * The caller holds no config lock.  Return ENOTSUP if the feature is not
+ * active, EIO if a slot cannot be read or a valid uberblock is left, or the
+ * error of a write or flush.
+ */
+int
+vdev_uberblock_erase(vdev_t *vd, uint64_t max_txg)
+{
+	spa_t *spa = vd->vdev_spa;
+	int flags = ZIO_FLAG_CONFIG_WRITER | ZIO_FLAG_CANFAIL;
+	int count = VDEV_UBERBLOCK_COUNT(vd);
+	size_t size = VDEV_LABELS * count * sizeof (uint64_t);
+	uint64_t *state;
+	abd_t *zeros;
+	int error;
+
+	ASSERT(vd->vdev_ops->vdev_op_leaf);
+	ASSERT(!spa->spa_sync_on);
+
+	if (!spa_feature_is_active(spa, SPA_FEATURE_ASYNC_MIRROR))
+		return (SET_ERROR(ENOTSUP));
+
+	state = kmem_alloc(size, KM_SLEEP);
+	zeros = abd_alloc_linear(VDEV_UBERBLOCK_SIZE(vd), B_TRUE);
+
+	abd_zero(zeros, VDEV_UBERBLOCK_SIZE(vd));
+	spa_config_enter(spa, SCL_STATE_ALL, FTAG, RW_READER);
+
+	vdev_uberblock_erase_read(vd, state, flags);
+	error = 0;
+	for (int i = 0; i < VDEV_LABELS * count; i++) {
+		if (state[i] == UB_ERASE_UNREAD) {
+			error = SET_ERROR(EIO);
+			break;
+		}
+	}
+	if (error == 0) {
+		error = vdev_uberblock_erase_write(vd, state, B_TRUE, max_txg,
+		    zeros, flags);
+	}
+	if (error == 0) {
+		error = vdev_uberblock_erase_write(vd, state, B_FALSE, max_txg,
+		    zeros, flags);
+	}
+	if (error == 0) {
+		vdev_uberblock_erase_read(vd, state, flags);
+		for (int i = 0; i < VDEV_LABELS * count; i++) {
+			if (state[i] != UB_ERASE_EMPTY) {
+				error = SET_ERROR(EIO);
+				break;
+			}
+		}
+	}
+
+	spa_config_exit(spa, SCL_STATE_ALL, FTAG);
+	abd_free(zeros);
+	kmem_free(state, size);
+	return (error);
 }
 
 /* Sync the uberblocks to all vdevs in svd[] */
@@ -2131,6 +2334,11 @@ vdev_label_sync(zio_t *zio, uint64_t *good_writes,
 	if (!vdev_writeable(vd))
 		return;
 
+	/* Labels on the lagging child stay as they were at activation. */
+	if (vd->vdev_spa->spa_async_mirror != NULL &&
+	    vdev_async_mirror_skip_labels(vd))
+		return;
+
 	/*
 	 * The top-level config never needs to be written to a distributed
 	 * spare.  When read vdev_dspare_label_read_config() will generate
@@ -2149,6 +2357,11 @@ vdev_label_sync(zio_t *zio, uint64_t *good_writes,
 		label = vdev_aux_label_generate(vd, vd->vdev_isspare);
 	} else {
 		label = spa_config_generate(vd->vdev_spa, vd, txg, B_FALSE);
+		if (vd->vdev_async_label_lineage != 0) {
+			fnvlist_add_uint64(label,
+			    ZPOOL_CONFIG_ASYNC_MIRROR_LINEAGE,
+			    vd->vdev_async_label_lineage);
+		}
 	}
 
 	vp_abd = abd_alloc_linear(sizeof (vdev_phys_t), B_TRUE);

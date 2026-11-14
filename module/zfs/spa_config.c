@@ -421,6 +421,23 @@ spa_config_generate(spa_t *spa, vdev_t *vd, uint64_t txg, int getstats)
 	nvlist_free(nvroot);
 	nvroot = fnvlist_lookup_nvlist(config, ZPOOL_CONFIG_VDEV_TREE);
 	vdev_config_generate_impl(spa, vd, nvroot, getstats, config_gen_flags);
+	if (getstats && vd == rvd && spa->spa_async_mirror != NULL) {
+		spa_async_mirror_stats_t *sams =
+		    &spa->spa_async_mirror_stats;
+		nvlist_t *am_stats = fnvlist_alloc();
+
+		fnvlist_add_uint64(am_stats,
+		    ZPOOL_CONFIG_ASYNC_MIRROR_APPLIED_TXG,
+		    sams->sams_applied_txg);
+		fnvlist_add_uint64(am_stats,
+		    ZPOOL_CONFIG_ASYNC_MIRROR_SYNCED_TXG,
+		    sams->sams_synced_txg);
+		fnvlist_add_uint64(am_stats, ZPOOL_CONFIG_ASYNC_MIRROR_PENDING,
+		    sams->sams_pending_bytes);
+		fnvlist_add_nvlist(nvroot, ZPOOL_CONFIG_ASYNC_MIRROR_STATS,
+		    am_stats);
+		fnvlist_free(am_stats);
+	}
 
 	/*
 	 * Store what's necessary for reading the MOS in the label.

@@ -28,6 +28,7 @@
 #include <sys/txg.h>
 #include <sys/spa_impl.h>
 #include <sys/vdev_impl.h>
+#include <sys/vdev_async_mirror.h>
 #include <sys/vdev_raidz.h>
 #include <sys/vdev_trim.h>
 #include <sys/zio_impl.h>
@@ -1771,7 +1772,8 @@ zio_vdev_delegated_io(vdev_t *vd, uint64_t offset, abd_t *data, uint64_t size,
 
 /*
  * Flush vd, or each leaf under it.  If propagate is false, a failed flush is
- * not an error of pio.
+ * not an error of pio, and the lagging child of an asynchronous mirror is
+ * skipped: its replay flushes it.
  */
 static void
 zio_flush_impl(zio_t *pio, vdev_t *vd, boolean_t propagate)
@@ -1794,6 +1796,9 @@ zio_flush_impl(zio_t *pio, vdev_t *vd, boolean_t propagate)
 		 */
 		if (!vdev_is_concrete(vd))
 			return;
+		if (!propagate && vd->vdev_spa->spa_async_mirror != NULL &&
+		    vdev_async_mirror_is_async(vd))
+			return;
 		zio_nowait(zio_create(pio, vd->vdev_spa, 0, NULL, NULL, 0, 0,
 		    NULL, NULL, ZIO_TYPE_FLUSH, ZIO_PRIORITY_NOW, flags, vd, 0,
 		    NULL, ZIO_STAGE_OPEN, ZIO_FLUSH_PIPELINE));
@@ -1812,6 +1817,20 @@ void
 zio_flush(zio_t *pio, vdev_t *vd)
 {
 	zio_flush_impl(pio, vd, B_FALSE);
+}
+
+/*
+ * Flush one leaf, also the lagging child of an asynchronous mirror, and let a
+ * failed flush reach pio: the replay must know that the data is not yet on
+ * the disk.  ENOTSUP was already cleared in the assess stage, which marks the
+ * vdev as having no write cache.
+ */
+void
+zio_flush_leaf(zio_t *pio, vdev_t *vd)
+{
+	ASSERT(vd->vdev_ops->vdev_op_leaf);
+
+	zio_flush_impl(pio, vd, B_TRUE);
 }
 
 void

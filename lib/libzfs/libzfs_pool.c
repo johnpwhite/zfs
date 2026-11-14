@@ -2548,6 +2548,38 @@ zpool_import_props(libzfs_handle_t *hdl, nvlist_t *config, const char *newname,
 			(void) zfs_error(hdl, EZFS_INVALCONFIG, desc);
 			break;
 
+		case ZFS_ERR_ASYNC_MIRROR_DIVERGED: {
+			uint64_t *div = NULL;
+			uint_t ndiv = 0;
+
+			if (nv != NULL && nvlist_lookup_nvlist(nv,
+			    ZPOOL_CONFIG_LOAD_INFO, &nvinfo) == 0 &&
+			    nvlist_lookup_uint64_array(nvinfo,
+			    ZPOOL_CONFIG_ASYNC_MIRROR_DIVERGED, &div,
+			    &ndiv) == 0 && ndiv == 4) {
+				zfs_error_aux(hdl, "the two copies of the "
+				    "asynchronous mirror were written "
+				    "separately.\nCopy %llu reached txg %llu.\n"
+				    "Copy %llu reached txg %llu.",
+				    (u_longlong_t)div[0], (u_longlong_t)div[1],
+				    (u_longlong_t)div[2], (u_longlong_t)div[3]);
+			} else {
+				zfs_error_aux(hdl, "the two copies of the "
+				    "asynchronous mirror were written "
+				    "separately.");
+			}
+			(void) zfs_error(hdl, EZFS_INVALCONFIG, desc);
+			(void) printf("Each copy can be imported alone and "
+			    "read-only, with the other device out of\n"
+			    "the search path.  To keep one copy, import the "
+			    "pool with\n"
+			    "'--async-mirror-keep=<guid>', the guid of the "
+			    "copy to keep.  The writes that only\n"
+			    "the other copy has are lost, and that copy is "
+			    "resilvered in full.\n");
+			break;
+		}
+
 		case EROFS:
 			zfs_error_aux(hdl,
 			    "one or more devices is read only");
@@ -6227,6 +6259,9 @@ zpool_get_vdev_prop_value(nvlist_t *nvprop, vdev_prop_t prop, char *prop_name,
 				return (ENOENT);
 			/* Only valid for top-level vdevs */
 			if (prop == VDEV_PROP_ALLOC_BIAS)
+				return (ENOENT);
+			/* Only valid for leaf vdevs */
+			if (prop == VDEV_PROP_ASYNC_MIRROR)
 				return (ENOENT);
 		}
 		if (vdev_prop_index_to_string(prop, intval,

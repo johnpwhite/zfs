@@ -771,6 +771,16 @@ zpool_standard_error_fmt(libzfs_handle_t *hdl, int error, const char *fmt, ...)
 	case ZFS_ERR_ASHIFT_MISMATCH:
 		zfs_verror(hdl, EZFS_ASHIFT_MISMATCH, fmt, ap);
 		break;
+	case ZFS_ERR_ASYNC_MIRROR_ACTIVE:
+		zfs_error_aux(hdl, "the pool has an active asynchronous "
+		    "mirror; turn the mode off first");
+		zfs_verror(hdl, EZFS_BUSY, fmt, ap);
+		break;
+	case ZFS_ERR_ASYNC_MIRROR_DIVERGED:
+		zfs_error_aux(hdl, "the two copies of the asynchronous mirror "
+		    "were written separately");
+		zfs_verror(hdl, EZFS_INVALCONFIG, fmt, ap);
+		break;
 	case ZFS_ERR_RAIDZ_EXPAND_TOO_WIDE:
 		zfs_error_aux(hdl,
 		    "this raidz vdev is too wide to be expanded");
