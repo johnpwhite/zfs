@@ -92,6 +92,8 @@ nobase_dist_datadir_zfs_tests_tests_DATA += \
 	functional/alloc_class/alloc_class.kshlib \
 	functional/anyraid/anyraid_common.kshlib \
 	functional/anyraid/default.cfg \
+	functional/async_mirror/async_mirror.cfg \
+	functional/async_mirror/async_mirror.kshlib \
 	functional/atime/atime.cfg \
 	functional/atime/atime_common.kshlib \
 	functional/bclone/bclone.cfg \
@@ -527,6 +529,98 @@ nobase_dist_datadir_zfs_tests_tests_SCRIPTS += \
 	functional/arc/dbufstats_002_pos.ksh \
 	functional/arc/dbufstats_003_pos.ksh \
 	functional/arc/setup.ksh \
+	functional/async_mirror/async_mirror_backlog_no_extra_txgs_pos.ksh \
+	functional/async_mirror/async_mirror_block_types_pos.ksh \
+	functional/async_mirror/async_mirror_catch_up_pos.ksh \
+	functional/async_mirror/async_mirror_checkpoint_reguid_neg.ksh \
+	functional/async_mirror/async_mirror_child_changes_neg.ksh \
+	functional/async_mirror/async_mirror_claimed_slog_pos.ksh \
+	functional/async_mirror/async_mirror_claimed_zil_copied_pos.ksh \
+	functional/async_mirror/async_mirror_claimed_zil_pos.ksh \
+	functional/async_mirror/async_mirror_config_mark_pos.ksh \
+	functional/async_mirror/async_mirror_damaged_data_pos.ksh \
+	functional/async_mirror/async_mirror_damaged_metadata_pos.ksh \
+	functional/async_mirror/async_mirror_deferred_block_pos.ksh \
+	functional/async_mirror/async_mirror_deferred_many_txgs_pos.ksh \
+	functional/async_mirror/async_mirror_detach_pos.ksh \
+	functional/async_mirror/async_mirror_disabled_plain_mirror_pos.ksh \
+	functional/async_mirror/async_mirror_erase_crash_pos.ksh \
+	functional/async_mirror/async_mirror_export_import_resume_pos.ksh \
+	functional/async_mirror/async_mirror_failed_copy_dtl_pos.ksh \
+	functional/async_mirror/async_mirror_failed_copy_resilver_pos.ksh \
+	functional/async_mirror/async_mirror_feature_active_pos.ksh \
+	functional/async_mirror/async_mirror_feature_active_until_match_pos.ksh \
+	functional/async_mirror/async_mirror_feature_enabled_after_off_pos.ksh \
+	functional/async_mirror/async_mirror_flush_failure_pos.ksh \
+	functional/async_mirror/async_mirror_fork_recorded_neg.ksh \
+	functional/async_mirror/async_mirror_freeze_persists_pos.ksh \
+	functional/async_mirror/async_mirror_frozen_no_release_pos.ksh \
+	functional/async_mirror/async_mirror_frozen_pool_txg_pos.ksh \
+	functional/async_mirror/async_mirror_held_space_enospc_pos.ksh \
+	functional/async_mirror/async_mirror_idle_after_write_pos.ksh \
+	functional/async_mirror/async_mirror_import_ends_freeze_pos.ksh \
+	functional/async_mirror/async_mirror_import_keeps_lagging_blocks_pos.ksh \
+	functional/async_mirror/async_mirror_import_keeps_live_blocks_neg.ksh \
+	functional/async_mirror/async_mirror_import_no_cksum_errors_pos.ksh \
+	functional/async_mirror/async_mirror_keep_lagging_copy_pos.ksh \
+	functional/async_mirror/async_mirror_keep_one_copy_pos.ksh \
+	functional/async_mirror/async_mirror_keep_unloadable_pos.ksh \
+	functional/async_mirror/async_mirror_lagging_alone_pos.ksh \
+	functional/async_mirror/async_mirror_lagging_alone_rewind_pos.ksh \
+	functional/async_mirror/async_mirror_lagging_alone_rewound_pos.ksh \
+	functional/async_mirror/async_mirror_lagging_alone_slog_pos.ksh \
+	functional/async_mirror/async_mirror_lagging_alone_txg_pos.ksh \
+	functional/async_mirror/async_mirror_lagging_alone_zil_pos.ksh \
+	functional/async_mirror/async_mirror_lagging_older_block_pos.ksh \
+	functional/async_mirror/async_mirror_lagging_rejoins_pos.ksh \
+	functional/async_mirror/async_mirror_leader_loss_pos.ksh \
+	functional/async_mirror/async_mirror_leader_write_error_pos.ksh \
+	functional/async_mirror/async_mirror_lost_metadata_freeze_pos.ksh \
+	functional/async_mirror/async_mirror_media_error_pos.ksh \
+	functional/async_mirror/async_mirror_multihost_neg.ksh \
+	functional/async_mirror/async_mirror_off_resilvers_zil_pos.ksh \
+	functional/async_mirror/async_mirror_old_software_pos.ksh \
+	functional/async_mirror/async_mirror_one_top_vdev_neg.ksh \
+	functional/async_mirror/async_mirror_plain_mirror_no_mark_pos.ksh \
+	functional/async_mirror/async_mirror_prop_ends_freeze_pos.ksh \
+	functional/async_mirror/async_mirror_prop_off_pos.ksh \
+	functional/async_mirror/async_mirror_prop_off_wait_pos.ksh \
+	functional/async_mirror/async_mirror_prop_on_pos.ksh \
+	functional/async_mirror/async_mirror_prop_persists_pos.ksh \
+	functional/async_mirror/async_mirror_prop_refused_neg.ksh \
+	functional/async_mirror/async_mirror_prop_switch_export_pos.ksh \
+	functional/async_mirror/async_mirror_read_retry_pos.ksh \
+	functional/async_mirror/async_mirror_readonly_import_fence_pos.ksh \
+	functional/async_mirror/async_mirror_readonly_lagging_no_fork_pos.ksh \
+	functional/async_mirror/async_mirror_readonly_rewind_fence_pos.ksh \
+	functional/async_mirror/async_mirror_release_idle_pos.ksh \
+	functional/async_mirror/async_mirror_remove_vdev_neg.ksh \
+	functional/async_mirror/async_mirror_removed_vdev_free_pos.ksh \
+	functional/async_mirror/async_mirror_resilver_lagging_pos.ksh \
+	functional/async_mirror/async_mirror_resilver_leader_pos.ksh \
+	functional/async_mirror/async_mirror_resilvering_child_neg.ksh \
+	functional/async_mirror/async_mirror_resilvering_leader_pos.ksh \
+	functional/async_mirror/async_mirror_rewind_child_ahead_pos.ksh \
+	functional/async_mirror/async_mirror_rewind_erase_uberblocks_pos.ksh \
+	functional/async_mirror/async_mirror_rewind_fence_pos.ksh \
+	functional/async_mirror/async_mirror_rewind_import_pos.ksh \
+	functional/async_mirror/async_mirror_rewind_resume_pos.ksh \
+	functional/async_mirror/async_mirror_rewound_child_history_pos.ksh \
+	functional/async_mirror/async_mirror_scrub_lagging_pos.ksh \
+	functional/async_mirror/async_mirror_send_receive_pos.ksh \
+	functional/async_mirror/async_mirror_split_lagging_ahead_neg.ksh \
+	functional/async_mirror/async_mirror_split_leader_ahead_neg.ksh \
+	functional/async_mirror/async_mirror_switch_txg_lineage_pos.ksh \
+	functional/async_mirror/async_mirror_sync_writes_pos.ksh \
+	functional/async_mirror/async_mirror_throttle_pos.ksh \
+	functional/async_mirror/async_mirror_transient_failure_pos.ksh \
+	functional/async_mirror/async_mirror_trim_initialize_neg.ksh \
+	functional/async_mirror/async_mirror_zdb_no_leak_pos.ksh \
+	functional/async_mirror/async_mirror_zdb_open_pos.ksh \
+	functional/async_mirror/async_mirror_zil_free_pos.ksh \
+	functional/async_mirror/async_mirror_zpool_status_pos.ksh \
+	functional/async_mirror/cleanup.ksh \
+	functional/async_mirror/setup.ksh \
 	functional/atime/atime_001_pos.ksh \
 	functional/atime/atime_002_neg.ksh \
 	functional/atime/atime_003_pos.ksh \
