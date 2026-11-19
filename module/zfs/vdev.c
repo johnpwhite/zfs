@@ -3386,6 +3386,26 @@ vdev_dtl_should_excise(vdev_t *vd, boolean_t rebuild_done)
 	} else {
 		dsl_scan_t *scn = vd->vdev_spa->spa_dsl_pool->dp_scan;
 		dsl_scan_phys_t *scnp __maybe_unused = &scn->scn_phys;
+		vdev_rebuild_phys_t *vrp =
+		    &vd->vdev_top->vdev_rebuild_config.vr_rebuild_phys;
+
+		/*
+		 * A leaf that a running sequential rebuild reconstructs keeps
+		 * its DTL until the rebuild completes.  A scrub that began
+		 * before the leaf was attached, and ends while the rebuild
+		 * runs, never read or wrote the leaf, but it would excise
+		 * [0, scn_max_txg) from its DTL.  The rebuild repairs a child
+		 * only where DTL_PARTIAL holds TXG_INITIAL (the birth of its
+		 * reads, see vdev_mirror_io_done()), so after such an
+		 * excision it copies nothing, and at its end it clears the
+		 * rest of the DTL: the old disk detaches from a new disk that
+		 * lacks the data.  The rebuild state is read without
+		 * vdev_rebuild_lock, which vdev_rebuild_complete_sync() holds
+		 * when it reassesses the DTLs.
+		 */
+		if (vd->vdev_rebuild_txg != 0 &&
+		    vrp->vrp_rebuild_state == VDEV_REBUILD_ACTIVE)
+			return (B_FALSE);
 
 		/* Resilver not initiated by attach */
 		if (vd->vdev_resilver_txg == 0)
