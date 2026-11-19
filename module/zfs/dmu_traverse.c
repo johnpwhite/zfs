@@ -818,8 +818,117 @@ traverse_pool(spa_t *spa, uint64_t txg_start, int flags,
 	return (err != 0 ? err : hard_err);
 }
 
+/*
+ * Traverse the datasets in a saved uberblock.  The MOS root names the
+ * dataset objects and their root block pointers for that state.  The caller
+ * keeps blocks freed after this state from being reused while the walk runs.
+ */
+static int
+traverse_pool_at_uberblock_impl(spa_t *spa, const struct uberblock *ub,
+    uint64_t resume_ds_obj, zbookmark_phys_t *resume, int flags,
+    boolean_t traverse_zil_logs, blkptr_cb_t func, void *arg)
+{
+	objset_t *mos;
+	uint64_t obj = 0;
+	int err = 0;
+
+	ASSERT(resume_ds_obj == 0 || resume != NULL);
+	if (resume_ds_obj == 0) {
+		err = traverse_impl(spa, NULL, 0,
+		    (blkptr_t *)&ub->ub_rootbp, 0, resume, flags, func, arg);
+		if (err != 0)
+			return (err);
+	}
+
+	err = dmu_objset_open_impl(spa, NULL,
+	    (blkptr_t *)&ub->ub_rootbp, &mos);
+	if (err != 0)
+		return (err);
+
+	while ((err = dmu_object_next(mos, &obj, B_FALSE, 0)) == 0) {
+		dmu_object_info_t doi;
+		dmu_buf_t *db;
+		blkptr_t rootbp;
+		zbookmark_phys_t *objresume;
+
+		if (resume_ds_obj != 0 && obj < resume_ds_obj)
+			continue;
+
+		err = dmu_object_info(mos, obj, &doi);
+		if (err != 0)
+			break;
+		if (doi.doi_bonus_type != DMU_OT_DSL_DATASET)
+			continue;
+		err = dmu_bonus_hold(mos, obj, FTAG, &db);
+		if (err != 0)
+			break;
+		rootbp = ((dsl_dataset_phys_t *)db->db_data)->ds_bp;
+		dmu_buf_rele(db, FTAG);
+		if (BP_IS_HOLE(&rootbp))
+			continue;
+
+		objresume = (obj == resume_ds_obj) ? resume : NULL;
+		err = traverse_impl(spa, NULL, obj, &rootbp, 0, objresume,
+		    flags, func, arg);
+		if (err != 0)
+			break;
+
+		if (traverse_zil_logs) {
+			arc_buf_t *buf;
+			arc_flags_t aflags = ARC_FLAG_WAIT;
+			zio_flag_t zio_flags = ZIO_FLAG_CANFAIL;
+			zbookmark_phys_t zb;
+			traverse_data_t td;
+
+			/* Traverse this dataset's intent log. */
+			if ((flags & TRAVERSE_NO_DECRYPT) &&
+			    BP_IS_PROTECTED(&rootbp))
+				zio_flags |= ZIO_FLAG_RAW;
+			SET_BOOKMARK(&zb, obj, ZB_ROOT_OBJECT, ZB_ROOT_LEVEL,
+			    ZB_ROOT_BLKID);
+			err = arc_read(NULL, spa, &rootbp, arc_getbuf_func,
+			    &buf, ZIO_PRIORITY_SYNC_READ, zio_flags, &aflags,
+			    &zb);
+			if (err != 0)
+				break;
+			memset(&td, 0, sizeof (td));
+			td.td_spa = spa;
+			td.td_objset = obj;
+			td.td_flags = flags;
+			td.td_func = func;
+			td.td_arg = arg;
+			traverse_zil(&td,
+			    &((objset_phys_t *)buf->b_data)->os_zil_header);
+			arc_buf_destroy(buf, &buf);
+		}
+	}
+	if (err == ESRCH)
+		err = 0;
+	dmu_objset_evict(mos);
+	return (err);
+}
+
+int
+traverse_pool_at_uberblock(spa_t *spa, const struct uberblock *ub, int flags,
+    blkptr_cb_t func, void *arg)
+{
+	return (traverse_pool_at_uberblock_impl(spa, ub, 0, NULL, flags,
+	    B_TRUE, func, arg));
+}
+
+int
+traverse_pool_at_uberblock_resume(spa_t *spa, const struct uberblock *ub,
+    uint64_t resume_ds_obj, zbookmark_phys_t *resume, int flags,
+    blkptr_cb_t func, void *arg)
+{
+	return (traverse_pool_at_uberblock_impl(spa, ub, resume_ds_obj,
+	    resume, flags, B_FALSE, func, arg));
+}
+
 EXPORT_SYMBOL(traverse_dataset);
 EXPORT_SYMBOL(traverse_pool);
+EXPORT_SYMBOL(traverse_pool_at_uberblock);
+EXPORT_SYMBOL(traverse_pool_at_uberblock_resume);
 
 ZFS_MODULE_PARAM(zfs, zfs_, pd_bytes_max, INT, ZMOD_RW,
 	"Max number of bytes to prefetch");

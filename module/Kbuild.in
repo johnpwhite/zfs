@@ -394,8 +394,13 @@ ZFS_OBJS := \
 	spa_config.o \
 	spa_errlog.o \
 	spa_history.o \
+	spa_lag.o \
 	spa_log_spacemap.o \
 	spa_misc.o \
+	spa_parity.o \
+	spa_parity_lineage.o \
+	spa_parity_repair.o \
+	spa_parity_ioctl.o \
 	spa_stats.o \
 	space_map.o \
 	space_reftree.o \

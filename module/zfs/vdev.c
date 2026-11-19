@@ -29,6 +29,7 @@
 #include <sys/fm/fs/zfs.h>
 #include <sys/spa.h>
 #include <sys/spa_impl.h>
+#include <sys/spa_parity_impl.h>
 #include <sys/bpobj.h>
 #include <sys/dmu.h>
 #include <sys/dmu_tx.h>
@@ -2449,11 +2450,21 @@ vdev_open(vdev_t *vd, cred_t *cred)
 	 * to do this as we've already validated that asize is greater than
 	 * vdev_min_asize.
 	 */
-	if (vd->vdev_state == VDEV_STATE_HEALTHY &&
-	    ((asize > vd->vdev_asize &&
-	    (vd->vdev_expanding || spa->spa_autoexpand)) ||
-	    (asize < vd->vdev_asize)))
-		vd->vdev_asize = asize;
+	/*
+	 * A parity set member that holds records grows only up to the size
+	 * the set granted (parity_grow_max); a reopen after a replace with a
+	 * larger disk must not grow it past that either.
+	 */
+	if (vd->vdev_state == VDEV_STATE_HEALTHY) {
+		uint64_t cap = spa_parity_grow_cap(spa);
+
+		if (asize > vd->vdev_asize &&
+		    (vd->vdev_expanding || spa->spa_autoexpand) &&
+		    MIN(asize, cap) > vd->vdev_asize)
+			vd->vdev_asize = MIN(asize, cap);
+		else if (asize < vd->vdev_asize)
+			vd->vdev_asize = asize;
+	}
 
 	vdev_set_min_asize(vd);
 
@@ -3402,9 +3413,16 @@ vdev_dtl_should_excise(vdev_t *vd, boolean_t rebuild_done)
 		 * lacks the data.  The rebuild state is read without
 		 * vdev_rebuild_lock, which vdev_rebuild_complete_sync() holds
 		 * when it reassesses the DTLs.
+		 *
+		 * On a parity set member (spa_parity_busy()) only a completed
+		 * rebuild clears such a DTL, also when the rebuild stopped: a
+		 * scrub or resilver repairs only live blocks, and the held
+		 * frees and other allocated ranges that parity needs would
+		 * be missing on the new disk.
 		 */
 		if (vd->vdev_rebuild_txg != 0 &&
-		    vrp->vrp_rebuild_state == VDEV_REBUILD_ACTIVE)
+		    (vrp->vrp_rebuild_state == VDEV_REBUILD_ACTIVE ||
+		    spa_parity_busy(vd->vdev_spa)))
 			return (B_FALSE);
 
 		/* Resilver not initiated by attach */
@@ -4768,6 +4786,15 @@ vdev_online(spa_t *spa, uint64_t guid, uint64_t flags, vdev_state_t *newstate)
 	if ((vd = spa_lookup_by_guid(spa, guid, B_TRUE)) == NULL)
 		return (spa_vdev_state_exit(spa, NULL, SET_ERROR(ENODEV)));
 
+	/* A parity set refuses online expansion while it holds records. */
+	boolean_t expand_blocked = spa_parity_expand_blocked(spa);
+
+	if ((flags & ZFS_ONLINE_EXPAND) && expand_blocked) {
+		return (spa_vdev_state_exit(spa, NULL,
+		    SET_ERROR(ZFS_ERR_PARITY_ACTIVE)));
+	}
+	boolean_t autoexpand = spa->spa_autoexpand && !expand_blocked;
+
 	wasoffline = (vd->vdev_offline || vd->vdev_tmpoffline);
 	oldstate = vd->vdev_state;
 
@@ -4781,7 +4808,7 @@ vdev_online(spa_t *spa, uint64_t guid, uint64_t flags, vdev_state_t *newstate)
 	if (!vd->vdev_aux) {
 		for (pvd = vd; pvd != rvd; pvd = pvd->vdev_parent)
 			pvd->vdev_expanding = !!((flags & ZFS_ONLINE_EXPAND) ||
-			    spa->spa_autoexpand);
+			    autoexpand);
 		vd->vdev_expansion_time = gethrestime_sec();
 	}
 
@@ -4801,7 +4828,7 @@ vdev_online(spa_t *spa, uint64_t guid, uint64_t flags, vdev_state_t *newstate)
 	    vd->vdev_parent->vdev_child[0] == vd)
 		vd->vdev_unspare = B_TRUE;
 
-	if ((flags & ZFS_ONLINE_EXPAND) || spa->spa_autoexpand) {
+	if ((flags & ZFS_ONLINE_EXPAND) || autoexpand) {
 
 		/* XXX - L2ARC 1.0 does not support expansion */
 		if (vd->vdev_aux)

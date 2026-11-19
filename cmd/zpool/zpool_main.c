@@ -104,6 +104,7 @@ static int zpool_do_initialize(int, char **);
 static int zpool_do_scrub(int, char **);
 static int zpool_do_resilver(int, char **);
 static int zpool_do_trim(int, char **);
+static int zpool_do_parity(int, char **);
 
 static int zpool_do_import(int, char **);
 static int zpool_do_export(int, char **);
@@ -159,6 +160,7 @@ typedef enum {
 	HELP_LIST,
 	HELP_OFFLINE,
 	HELP_ONLINE,
+	HELP_PARITY,
 	HELP_PREFETCH,
 	HELP_REPLACE,
 	HELP_REMOVE,
@@ -402,6 +404,7 @@ static zpool_command_t command_table[] = {
 	{ "scrub",	zpool_do_scrub,		HELP_SCRUB		},
 	{ "trim",	zpool_do_trim,		HELP_TRIM		},
 	{ "condense",	zpool_do_condense,	HELP_CONDENSE		},
+	{ "parity",	zpool_do_parity,	HELP_PARITY		},
 	{ NULL },
 	{ "import",	zpool_do_import,	HELP_IMPORT		},
 	{ "export",	zpool_do_export,	HELP_EXPORT		},
@@ -467,7 +470,8 @@ get_usage(zpool_help_t idx)
 		    "\timport [-o mntopts] [-o property=value] ... \n"
 		    "\t    [-d dir | -c cachefile] [-D] [-l] [-f] [-m] [-N] "
 		    "[-R root] [-F [-n]]\n"
-		    "\t    [--rewind-to-checkpoint] <pool | id> [newpool]\n");
+		    "\t    [--rewind-to-checkpoint] [--parity-override]\n"
+		    "\t    <pool | id> [newpool]\n");
 	case HELP_IOSTAT:
 		return ("\tiostat [[[-c [script1,script2,...]"
 		    "[-lq]]|[-rw]] [-T d | u] [-ghHLpPvy]\n"
@@ -545,6 +549,10 @@ get_usage(zpool_help_t idx)
 		    "<pool> [interval]\n");
 	case HELP_DDT_PRUNE:
 		return ("\tddtprune -d|-p <amount> <pool>\n");
+	case HELP_PARITY:
+		return ("\tparity status [-Hp] [pool]\n"
+		    "\tparity drop [-f] <pool>\n"
+		    "\tparity reclaim [-r] <pool> [zdb-output]\n");
 	default:
 		__builtin_unreachable();
 	}
@@ -4224,6 +4232,7 @@ zpool_do_checkpoint(int argc, char **argv)
 }
 
 #define	CHECKPOINT_OPT	1024
+#define	PARITY_OVERRIDE_OPT	1025
 
 /*
  * zpool prefetch [-t <type>] <pool>
@@ -4388,6 +4397,7 @@ zpool_do_import(int argc, char **argv)
 
 	struct option long_options[] = {
 		{"rewind-to-checkpoint", no_argument, NULL, CHECKPOINT_OPT},
+		{"parity-override", no_argument, NULL, PARITY_OVERRIDE_OPT},
 		{0, 0, 0, 0}
 	};
 
@@ -4479,6 +4489,9 @@ zpool_do_import(int argc, char **argv)
 			break;
 		case CHECKPOINT_OPT:
 			flags |= ZFS_IMPORT_CHECKPOINT;
+			break;
+		case PARITY_OVERRIDE_OPT:
+			flags |= ZFS_IMPORT_PARITY_OVERRIDE;
 			break;
 		case ':':
 			(void) fprintf(stderr, "missing argument for "
@@ -14219,6 +14232,481 @@ zpool_do_ddt_prune(int argc, char **argv)
 	zpool_close(zhp);
 
 	return (error);
+}
+
+/*
+ * zpool parity status [-Hp] [pool]
+ * zpool parity drop [-f] <pool>
+ *
+ * Show the parity set state of a pool, or discard its parity records.
+ */
+typedef struct parity_status_data {
+	boolean_t	ps_scripted;
+	boolean_t	ps_parsable;
+} parity_status_data_t;
+
+static void
+parity_print_num(boolean_t scripted, boolean_t parsable, const char *name,
+    const char *label, uint64_t value, boolean_t bytes)
+{
+	char buf[32];
+
+	if (scripted) {
+		(void) printf("%s\t%llu\n", name, (u_longlong_t)value);
+		return;
+	}
+	if (bytes && !parsable)
+		zfs_nicebytes(value, buf, sizeof (buf));
+	else
+		(void) snprintf(buf, sizeof (buf), "%llu",
+		    (u_longlong_t)value);
+	(void) printf("%12s: %s\n", label, buf);
+}
+
+static int
+parity_status_cb(zpool_handle_t *zhp, void *data)
+{
+	parity_status_data_t *pd = data;
+	const char *pool = zpool_get_name(zhp);
+	boolean_t sc = pd->ps_scripted, pa = pd->ps_parsable;
+	nvlist_t *nv = NULL;
+	const char *state, *throttle;
+	uint64_t oldest, age;
+	boolean_t unprotected;
+	int error;
+
+	error = lzc_parity_info(pool, &nv);
+	if (error != 0) {
+		(void) fprintf(stderr, "cannot get the parity "
+		    "state of '%s': %s\n", pool, strerror(error));
+		return (1);
+	}
+
+	state = fnvlist_lookup_string(nv, ZPARITY_STATE);
+	throttle = fnvlist_lookup_string(nv, ZPARITY_THROTTLE);
+	oldest = fnvlist_lookup_uint64(nv, ZPARITY_OLDEST_TXG);
+	age = fnvlist_lookup_uint64(nv, ZPARITY_OLDEST_AGE);
+	unprotected = fnvlist_lookup_boolean_value(nv, ZPARITY_UNPROTECTED);
+
+	if (sc) {
+		(void) printf("pool\t%s\n", pool);
+		(void) printf("state\t%s\n", state);
+	} else {
+		(void) printf("%12s: %s\n", "pool", pool);
+		(void) printf("%12s: %s\n", "state", state);
+	}
+	parity_print_num(sc, pa, "generation", "generation",
+	    fnvlist_lookup_uint64(nv, ZPARITY_GENERATION), B_FALSE);
+	parity_print_num(sc, pa, "applied_txg", "applied txg",
+	    fnvlist_lookup_uint64(nv, ZPARITY_APPLIED_TXG), B_FALSE);
+	parity_print_num(sc, pa, "first_txg", "first txg",
+	    fnvlist_lookup_uint64(nv, ZPARITY_FIRST_TXG), B_FALSE);
+	parity_print_num(sc, pa, "last_txg", "last txg",
+	    fnvlist_lookup_uint64(nv, ZPARITY_LAST_TXG), B_FALSE);
+	parity_print_num(sc, pa, "oldest_txg", "oldest txg", oldest, B_FALSE);
+	parity_print_num(sc, pa, "oldest_age", "oldest age", age, B_FALSE);
+	if (!sc) {
+		/* The lag: the oldest record that is not applied. */
+		if (oldest == 0) {
+			(void) printf("%12s: %s\n", "lag", "none");
+		} else {
+			(void) printf("%12s: txg %llu, %llu seconds old\n",
+			    "lag", (u_longlong_t)oldest, (u_longlong_t)age);
+		}
+	}
+	parity_print_num(sc, pa, "pending_bytes", "pending",
+	    fnvlist_lookup_uint64(nv, ZPARITY_PENDING_BYTES), B_TRUE);
+	parity_print_num(sc, pa, "held_bytes", "held",
+	    fnvlist_lookup_uint64(nv, ZPARITY_HELD_BYTES), B_TRUE);
+	{
+		/* The throttle compares these with their limits. */
+		uint64_t v;
+
+		if (nvlist_lookup_uint64(nv, ZPARITY_MAX_HELD_BYTES, &v) == 0)
+			parity_print_num(sc, pa, "max_held_bytes",
+			    "held limit", v, B_TRUE);
+		if (nvlist_lookup_uint64(nv, ZPARITY_RECORD_BYTES, &v) == 0)
+			parity_print_num(sc, pa, "record_bytes", "records",
+			    v, B_TRUE);
+		if (nvlist_lookup_uint64(nv, ZPARITY_MAX_RECORD_BYTES,
+		    &v) == 0)
+			parity_print_num(sc, pa, "max_record_bytes",
+			    "record limit", v, B_TRUE);
+	}
+	{
+		uint64_t leaked = 0;
+
+		(void) nvlist_lookup_uint64(nv, ZPARITY_LEAKED_BYTES, &leaked);
+		parity_print_num(sc, pa, "leaked_bytes", "leaked", leaked,
+		    B_TRUE);
+	}
+	if (sc) {
+		(void) printf("throttle\t%s\n", throttle);
+		(void) printf("unprotected\t%d\n", unprotected ? 1 : 0);
+		if (unprotected)
+			(void) printf("warning\tnot protected, resync "
+			    "needed\n");
+	} else {
+		(void) printf("%12s: %s\n", "throttle", throttle);
+		if (unprotected)
+			(void) printf("%12s: %s\n", "warning",
+			    "not protected, resync needed");
+		(void) printf("\n");
+	}
+
+	fnvlist_free(nv);
+	return (0);
+}
+
+static int
+zpool_do_parity_status(int argc, char **argv)
+{
+	parity_status_data_t pd = { B_FALSE, B_FALSE };
+	int c;
+
+	while ((c = getopt(argc, argv, "Hp")) != -1) {
+		switch (c) {
+		case 'H':
+			pd.ps_scripted = B_TRUE;
+			break;
+		case 'p':
+			pd.ps_parsable = B_TRUE;
+			break;
+		case '?':
+			(void) fprintf(stderr, "invalid option "
+			    "'%c'\n", optopt);
+			usage(B_FALSE);
+		}
+	}
+	argc -= optind;
+	argv += optind;
+
+	/* No pool: every imported pool. */
+	return (for_each_pool(argc, argv, B_TRUE, NULL, ZFS_TYPE_POOL,
+	    B_FALSE, parity_status_cb, &pd));
+}
+
+static int
+zpool_do_parity_drop(int argc, char **argv)
+{
+	boolean_t force = B_FALSE;
+	zpool_handle_t *zhp;
+	nvlist_t *nv = NULL;
+	const char *pool;
+	uint64_t generation, set_guid;
+	int c, error;
+
+	while ((c = getopt(argc, argv, "f")) != -1) {
+		switch (c) {
+		case 'f':
+			force = B_TRUE;
+			break;
+		case '?':
+			(void) fprintf(stderr, "invalid option "
+			    "'%c'\n", optopt);
+			usage(B_FALSE);
+		}
+	}
+	argc -= optind;
+	argv += optind;
+
+	if (argc < 1) {
+		(void) fprintf(stderr, "missing pool argument\n");
+		usage(B_FALSE);
+	} else if (argc > 1) {
+		(void) fprintf(stderr, "too many arguments\n");
+		usage(B_FALSE);
+	}
+
+	if ((zhp = zpool_open(g_zfs, argv[0])) == NULL)
+		return (1);
+	pool = zpool_get_name(zhp);
+
+	if (!force) {
+		char answer[16];
+
+		(void) fprintf(stderr, "This discards all parity "
+		    "records of pool '%s'.\nThe parity set must resync this "
+		    "pool before the parity covers it again.\n", pool);
+		if (!isatty(STDIN_FILENO)) {
+			(void) fprintf(stderr, "not a terminal: use "
+			    "-f to drop the records\n");
+			zpool_close(zhp);
+			return (1);
+		}
+		(void) fprintf(stderr, "Drop the records? [y/N] ");
+		if (fgets(answer, sizeof (answer), stdin) == NULL ||
+		    (answer[0] != 'y' && answer[0] != 'Y')) {
+			zpool_close(zhp);
+			return (1);
+		}
+	}
+
+	/* The drop is tied to the generation that INFO reports. */
+	error = lzc_parity_info(pool, &nv);
+	if (error == 0) {
+		generation = fnvlist_lookup_uint64(nv, ZPARITY_GENERATION);
+		set_guid = fnvlist_lookup_uint64(nv, ZPARITY_SET_GUID);
+		fnvlist_free(nv);
+		error = lzc_parity_drop_set(pool, set_guid, generation);
+	}
+	if (error == ENOTSUP) {
+		(void) fprintf(stderr, "pool '%s' has no parity "
+		    "records\n", pool);
+	} else if (error == EINTR) {
+		(void) fprintf(stderr, "interrupted: the drop of "
+		    "pool '%s' goes on\n", pool);
+	} else if (error == ZFS_ERR_PARITY_SET_MISMATCH) {
+		(void) fprintf(stderr, "pool '%s' belongs to another parity "
+		    "set\n", pool);
+	} else if (error != 0) {
+		(void) fprintf(stderr, "cannot drop the parity "
+		    "records of '%s': %s\n", pool, strerror(error));
+	}
+	zpool_close(zhp);
+	return (error != 0 ? 1 : 0);
+}
+
+static int
+parity_range_cmp(const void *a, const void *b)
+{
+	const uint64_t *x = a, *y = b;
+
+	if (x[0] != y[0])
+		return (x[0] < y[0] ? -1 : 1);
+	if (x[1] != y[1])
+		return (x[1] < y[1] ? -1 : 1);
+	return (0);
+}
+
+#define	RECLAIM_BATCH_MAX	4096
+#define	RECLAIM_RANGES_MAX	65536
+
+/* zdb output is uploaded in bounded batches, then committed as one reclaim. */
+static int
+zpool_do_parity_reclaim(int argc, char **argv)
+{
+	uint64_t *r = NULL, txg = 0, pool_guid, file_guid = 0;
+	uint64_t reclaimed, left, file_errors = 0;
+	size_t n = 0, cap = 0;
+	char line[512];
+	nvlist_t *out = NULL, *info = NULL;
+	FILE *f = NULL;
+	boolean_t reset = B_FALSE, have_header = B_FALSE;
+	int error = 0;
+
+	argc--;
+	argv++;
+	if (argc > 0 && strcmp(argv[0], "-r") == 0) {
+		reset = B_TRUE;
+		argc--;
+		argv++;
+	}
+	if ((!reset && argc != 2) || (reset && argc != 1)) {
+		(void) fprintf(stderr, "usage: zpool parity reclaim "
+		    "[-r] <pool> [zdb-output]\n");
+		usage(B_FALSE);
+	}
+
+	error = lzc_parity_info(argv[0], &info);
+	if (error != 0) {
+		(void) fprintf(stderr, "cannot read parity info for '%s': %s\n",
+		    argv[0], strerror(error));
+		return (1);
+	}
+	pool_guid = fnvlist_lookup_uint64(info, ZPARITY_POOL_GUID);
+	fnvlist_free(info);
+	if (reset) {
+		error = lzc_parity_reclaim(argv[0], pool_guid, 0,
+		    ZPARITY_RECLAIM_RESET, NULL, 0, &out);
+		if (error == 0) {
+			(void) printf("pool '%s': leaked-space accounting "
+			    "reset; no ranges freed\n", argv[0]);
+			if (out != NULL)
+				fnvlist_free(out);
+			return (0);
+		}
+		(void) fprintf(stderr, "cannot reset leaked-space accounting "
+		    "for '%s': %s\n", argv[0], strerror(error));
+		if (out != NULL)
+			fnvlist_free(out);
+		return (1);
+	}
+	f = strcmp(argv[1], "-") == 0 ? stdin : fopen(argv[1], "r");
+	if (f == NULL) {
+		(void) fprintf(stderr, "cannot open '%s': %s\n", argv[1],
+		    strerror(errno));
+		return (1);
+	}
+	while (fgets(line, sizeof (line), f) != NULL) {
+		u_longlong_t guid, header_txg, errors;
+		u_longlong_t v, o, s;
+
+		if (strncmp(line, "parity reclaim:", 15) == 0) {
+			int used = 0;
+
+			if (sscanf(line, "parity reclaim: pool_guid %llu, "
+			    "txg %llu, "
+			    "errors %llu%n", &guid, &header_txg, &errors,
+			    &used) != 3 || (line[used] != '\n' &&
+			    line[used] != '\r' && line[used] != '\0')) {
+				error = EINVAL;
+				break;
+			}
+			if (have_header) {
+				error = EINVAL;
+				break;
+			}
+			have_header = B_TRUE;
+			file_guid = guid;
+			txg = header_txg;
+			file_errors = errors;
+			continue;
+		}
+		if (strncmp(line, "leaked space:", 13) != 0)
+			continue;
+		if (sscanf(line, "leaked space: vdev %llu, offset 0x%llx, "
+		    "size %llu", &v, &o, &s) != 3 || s == 0) {
+			error = EINVAL;
+			break;
+		}
+		if (n == RECLAIM_RANGES_MAX) {
+			error = E2BIG;
+			break;
+		}
+		if (n == cap) {
+			uint64_t *tmp;
+
+			cap = MIN(cap ? cap * 2 : 64, RECLAIM_RANGES_MAX);
+			tmp = realloc(r, cap * 3 * sizeof (uint64_t));
+			if (tmp == NULL) {
+				error = ENOMEM;
+				break;
+			}
+			r = tmp;
+		}
+		r[n * 3] = v;
+		r[n * 3 + 1] = o;
+		r[n * 3 + 2] = s;
+		n++;
+	}
+	if (error == 0 && ferror(f))
+		error = EIO;
+	if (f != stdin && fclose(f) != 0 && error == 0)
+		error = errno;
+	if (error != 0) {
+		(void) fprintf(stderr, "invalid zdb reclaim output: %s\n",
+		    strerror(error));
+		free(r);
+		return (1);
+	}
+	if (!have_header || txg == 0) {
+		(void) fprintf(stderr, "zdb output has no reclaim header\n");
+		free(r);
+		return (1);
+	}
+	if (file_errors != 0) {
+		(void) fprintf(stderr, "zdb reported %llu errors; "
+		    "nothing freed\n",
+		    (u_longlong_t)file_errors);
+		free(r);
+		return (1);
+	}
+	if (file_guid != pool_guid) {
+		(void) fprintf(stderr, "zdb output belongs to another pool; "
+		    "nothing freed\n");
+		free(r);
+		return (1);
+	}
+	if (n == 0) {
+		(void) fprintf(stderr, "zdb output has no leaked ranges; "
+		    "use -r only to reset the accounting\n");
+		free(r);
+		return (1);
+	}
+	if (n > 0)
+		qsort(r, n, 3 * sizeof (uint64_t), parity_range_cmp);
+
+	for (size_t first = 0; first < n; first += RECLAIM_BATCH_MAX) {
+		size_t count = MIN(RECLAIM_BATCH_MAX, n - first);
+
+		error = lzc_parity_reclaim(argv[0], pool_guid, txg,
+		    ZPARITY_RECLAIM_STAGE, &r[first * 3], (uint_t)count, &out);
+		if (out != NULL)
+			fnvlist_free(out);
+		out = NULL;
+		if (error != 0) {
+			(void) lzc_parity_reclaim(argv[0], pool_guid, txg,
+			    ZPARITY_RECLAIM_ABORT, NULL, 0, NULL);
+			break;
+		}
+	}
+	if (error == 0)
+		error = lzc_parity_reclaim(argv[0], pool_guid, txg,
+		    ZPARITY_RECLAIM_COMMIT, NULL, 0, &out);
+	free(r);
+	if (error == 0) {
+		reclaimed = fnvlist_lookup_uint64(out, ZPARITY_RECLAIMED);
+		left = fnvlist_lookup_uint64(out, ZPARITY_LEAKED_BYTES);
+		(void) printf("pool '%s': %llu bytes in %zu ranges freed, "
+		    "%llu leaked bytes left\n", argv[0],
+		    (u_longlong_t)reclaimed, n, (u_longlong_t)left);
+		fnvlist_free(out);
+		return (0);
+	}
+	switch (error) {
+	case ENOENT:
+		(void) fprintf(stderr, "pool '%s' has no leaked space\n",
+		    argv[0]);
+		break;
+	case ESTALE:
+		(void) fprintf(stderr, "txg %llu is not the state that this "
+		    "import of '%s' loaded: run zdb on the exported pool "
+		    "again\n", (u_longlong_t)txg, argv[0]);
+		break;
+	case EEXIST:
+		(void) fprintf(stderr, "a range is not allocated or is in "
+		    "use: nothing freed\n");
+		break;
+	case EBUSY:
+		(void) fprintf(stderr, "a range is held by a parity record: "
+		    "nothing freed\n");
+		break;
+	case EOVERFLOW:
+		(void) fprintf(stderr, "the ranges exceed the leaked space: "
+		    "nothing freed\n");
+		break;
+	case EINVAL:
+		(void) fprintf(stderr, "the complete reclaim list is invalid "
+		    "or "
+		    "does not match the leaked byte count\n");
+		break;
+	default:
+		(void) fprintf(stderr, "cannot reclaim the leaked space of "
+		    "'%s': %s\n", argv[0], strerror(error));
+	}
+	return (1);
+}
+
+int
+zpool_do_parity(int argc, char **argv)
+{
+	if (argc < 2) {
+		(void) fprintf(stderr, "missing subcommand\n");
+		usage(B_FALSE);
+	}
+	/* The subcommand becomes argv[0] for getopt(). */
+	argc--;
+	argv++;
+	if (strcmp(argv[0], "status") == 0)
+		return (zpool_do_parity_status(argc, argv));
+	if (strcmp(argv[0], "drop") == 0)
+		return (zpool_do_parity_drop(argc, argv));
+	if (strcmp(argv[0], "reclaim") == 0)
+		return (zpool_do_parity_reclaim(argc, argv));
+	(void) fprintf(stderr, "unknown subcommand '%s'\n", argv[0]);
+	usage(B_FALSE);
+	return (1);
 }
 
 static int

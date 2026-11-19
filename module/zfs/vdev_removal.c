@@ -18,6 +18,7 @@
 
 #include <sys/zfs_context.h>
 #include <sys/spa_impl.h>
+#include <sys/spa_parity_impl.h>
 #include <sys/dmu.h>
 #include <sys/dmu_tx.h>
 #include <sys/zap.h>
@@ -2265,6 +2266,14 @@ spa_vdev_remove_top_check(vdev_t *vd)
 
 	if (vd != vd->vdev_top)
 		return (SET_ERROR(ENOTSUP));
+
+	/*
+	 * A member stays one while its parity folder or property is on disk,
+	 * even with parity off and no records: the set still holds its
+	 * columns by vdev id. Same test as the attach check.
+	 */
+	if (spa_parity_busy(spa) || spa_parity_member_on_disk(spa))
+		return (SET_ERROR(ZFS_ERR_PARITY_ACTIVE));
 
 	if (!vdev_is_concrete(vd))
 		return (SET_ERROR(ENOTSUP));

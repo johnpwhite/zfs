@@ -44,6 +44,7 @@
 .Op Fl DflmMt
 .Op Fl F Op Fl nTX
 .Op Fl -rewind-to-checkpoint
+.Op Fl -parity-override
 .Op Fl c Ar cachefile Ns | Ns Fl d Ar dir Ns | Ns Ar device
 .Op Fl o Ar mntopts
 .Oo Fl o Ar property Ns = Ns Ar value Oc Ns …
@@ -213,6 +214,14 @@ and the
 .Sy altroot
 property to
 .Ar root .
+.It Fl -parity-override
+Import a parity set member read-write when its parity records cannot be read
+or their state is not known.
+The records stay off for this import and are dropped at the first sync.
+The parity set must then resync the pool.
+The same as the module parameter
+.Sy zfs_parity_import_override
+for one import.
 .It Fl -rewind-to-checkpoint
 Rewinds pool to the checkpointed state.
 Once the pool is imported with this flag there is no way to undo the rewind.

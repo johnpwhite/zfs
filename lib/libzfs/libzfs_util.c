@@ -512,6 +512,36 @@ zfs_standard_error_fmt(libzfs_handle_t *hdl, int error, const char *fmt, ...)
 	case ZFS_ERR_NO_USER_NS_SUPPORT:
 		zfs_verror(hdl, EZFS_NO_USER_NS_SUPPORT, fmt, ap);
 		break;
+	/*
+	 * The parity set codes reach dataset commands too (zfs set checksum=
+	 * off, zfs create, zfs recv): without them EZFS_UNKNOWN aborts zfs.
+	 */
+	case ZFS_ERR_PARITY_ACTIVE:
+		zfs_error_aux(hdl,
+		    "the pool is in a parity set (parityset is on, or its "
+		    "records are not yet applied)");
+		zfs_verror(hdl, EZFS_BUSY, fmt, ap);
+		break;
+	case ZFS_ERR_PARITY_CHECKSUM:
+		zfs_error_aux(hdl,
+		    "a pool in a parity set cannot have a dataset with the "
+		    "checksum property set to off or noparity");
+		zfs_verror(hdl, EZFS_BADPROP, fmt, ap);
+		break;
+	case ZFS_ERR_PARITY_SET_MISMATCH:
+		zfs_error_aux(hdl, "the pool belongs to another parity set");
+		zfs_verror(hdl, EZFS_BUSY, fmt, ap);
+		break;
+	case ZFS_ERR_PARITY_UNVERIFIABLE:
+		zfs_error_aux(hdl, "the block has no checksum and no parity "
+		    "record names it");
+		zfs_verror(hdl, EZFS_NOTSUP, fmt, ap);
+		break;
+	case ZFS_ERR_PARITY_TOO_LARGE:
+		zfs_error_aux(hdl, "the new vdev is larger than the parity set "
+		    "covers (the largest data vdev, or parity_grow_max)");
+		zfs_verror(hdl, EZFS_BADDEV, fmt, ap);
+		break;
 	default:
 		zfs_error_aux(hdl, "%s", zfs_strerror(error));
 		zfs_verror(hdl, EZFS_UNKNOWN, fmt, ap);
@@ -775,6 +805,32 @@ zpool_standard_error_fmt(libzfs_handle_t *hdl, int error, const char *fmt, ...)
 		zfs_error_aux(hdl,
 		    "this raidz vdev is too wide to be expanded");
 		zfs_verror(hdl, EZFS_BADTARGET, fmt, ap);
+		break;
+	case ZFS_ERR_PARITY_ACTIVE:
+		zfs_error_aux(hdl,
+		    "the pool is in a parity set (parityset is on, or its "
+		    "records are not yet applied)");
+		zfs_verror(hdl, EZFS_BUSY, fmt, ap);
+		break;
+	case ZFS_ERR_PARITY_CHECKSUM:
+		zfs_error_aux(hdl,
+		    "a pool in a parity set cannot have a dataset with the "
+		    "checksum property set to off or noparity");
+		zfs_verror(hdl, EZFS_BADPROP, fmt, ap);
+		break;
+	case ZFS_ERR_PARITY_SET_MISMATCH:
+		zfs_error_aux(hdl, "the pool belongs to another parity set");
+		zfs_verror(hdl, EZFS_BUSY, fmt, ap);
+		break;
+	case ZFS_ERR_PARITY_UNVERIFIABLE:
+		zfs_error_aux(hdl, "the block has no checksum and no parity "
+		    "record names it");
+		zfs_verror(hdl, EZFS_NOTSUP, fmt, ap);
+		break;
+	case ZFS_ERR_PARITY_TOO_LARGE:
+		zfs_error_aux(hdl, "the new vdev is larger than the parity set "
+		    "covers (the largest data vdev, or parity_grow_max)");
+		zfs_verror(hdl, EZFS_BADDEV, fmt, ap);
 		break;
 	case ZFS_ERR_TOO_MANY_SITOUTS:
 		zfs_error_aux(hdl, "too many disks "

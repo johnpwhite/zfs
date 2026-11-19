@@ -27,6 +27,7 @@
 
 #include <sys/spa.h>
 #include <sys/spa_checkpoint.h>
+#include <sys/spa_lag.h>
 #include <sys/spa_log_spacemap.h>
 #include <sys/vdev.h>
 #include <sys/vdev_rebuild.h>
@@ -366,6 +367,26 @@ struct spa {
 	spa_checkpoint_info_t spa_checkpoint_info; /* checkpoint accounting */
 	zthr_t		*spa_checkpoint_discard_zthr;
 
+	/* Parity set: lagging consumers (spa_lag.c) and their state. */
+	struct spa_lag	*spa_lag[SPA_LAG_MAX];
+	struct spa_parity *spa_parity;
+	uint64_t	spa_parity_blocks_walks;
+	uint64_t	spa_parity_leaked;
+	kmutex_t	spa_parity_reclaim_lock;
+	uint64_t	*spa_parity_reclaim_ranges;
+	uint64_t	spa_parity_reclaim_guid;
+	uint64_t	spa_parity_reclaim_txg;
+	uint64_t	spa_parity_reclaim_total;
+	uint_t		spa_parity_reclaim_n;
+	boolean_t	spa_parity_reclaim_active;
+	uint64_t	spa_parity_onstall;	/* ZPOOL_PARITY_ONSTALL_* */
+	uint64_t	spa_parity_max_records;	/* bytes, 0: module default */
+	uint64_t	spa_parity_max_held;	/* percent, 0: module default */
+	uint64_t	spa_parity_grow_max;	/* bytes; growth while busy */
+	uint64_t	spa_parity_pace;	/* follow the apply rate */
+	/* Import with parityset=on: arm the capture before the claim txg. */
+	boolean_t	spa_parity_import_on;
+
 	kmutex_t	spa_txg_log_time_lock;	/* for spa_txg_log_time */
 	dbrrd_t		spa_txg_log_time;
 	uint64_t	spa_last_noted_txg;
@@ -516,6 +537,101 @@ struct spa {
 	spa_config_lock_t spa_config_lock[SCL_LOCKS]; /* config changes */
 	zfs_refcount_t	spa_refcount;		/* number of opens */
 };
+
+/*
+ * Core hooks of the lagging consumers (spa_lag.h).  A pool with no consumer
+ * pays one load and one branch for each hook: the test is here, and the
+ * out-of-line *_impl() function does the real work.  The consumer is
+ * registered before any I/O of the pool and unregistered only in
+ * spa_unload() (see spa_lag.c), so a lock-free read of the slot is correct.
+ */
+static inline boolean_t
+spa_lag_active(spa_t *spa)
+{
+	return (spa->spa_lag[0] != NULL);
+}
+
+static inline void
+spa_lag_note_alloc(spa_t *spa, const blkptr_t *bp, uint64_t txg)
+{
+	if (spa_lag_active(spa))
+		spa_lag_note_alloc_impl(spa, bp, txg);
+}
+
+static inline void
+spa_lag_note_unalloc(spa_t *spa, const blkptr_t *bp, uint64_t txg)
+{
+	if (spa_lag_active(spa))
+		spa_lag_note_unalloc_impl(spa, bp, txg);
+}
+
+static inline uint_t
+spa_lag_hold_free(spa_t *spa, const blkptr_t *bp, uint64_t txg)
+{
+	return (spa_lag_active(spa) ?
+	    spa_lag_hold_free_impl(spa, bp, txg) : 0);
+}
+
+static inline void
+spa_lag_write_ready(spa_t *spa, const blkptr_t *bp, uint64_t txg)
+{
+	if (spa_lag_active(spa))
+		spa_lag_write_ready_impl(spa, bp, txg);
+}
+
+static inline void
+spa_lag_sync_pass(spa_t *spa, dmu_tx_t *tx, boolean_t noop)
+{
+	if (spa_lag_active(spa))
+		spa_lag_sync_pass_impl(spa, tx, noop);
+}
+
+static inline void
+spa_lag_flush(spa_t *spa, dmu_tx_t *tx)
+{
+	if (spa_lag_active(spa))
+		spa_lag_flush_impl(spa, tx);
+}
+
+static inline void
+spa_lag_txg_synced(spa_t *spa, uint64_t txg)
+{
+	if (spa_lag_active(spa))
+		spa_lag_txg_synced_impl(spa, txg);
+}
+
+static inline void
+spa_lag_verify_alloc(spa_t *spa, vdev_t *vd, zfs_range_tree_t *rt,
+    uint64_t txg)
+{
+	if (spa_lag_active(spa))
+		spa_lag_verify_alloc_impl(spa, vd, rt, txg);
+}
+
+static inline uint64_t
+spa_lag_held_dspace(spa_t *spa)
+{
+	return (spa_lag_active(spa) ? spa_lag_held_dspace_impl(spa) : 0);
+}
+
+static inline hrtime_t
+spa_lag_delay(spa_t *spa)
+{
+	return (spa_lag_active(spa) ? spa_lag_delay_impl(spa) : 0);
+}
+
+static inline int
+spa_lag_wait(spa_t *spa)
+{
+	return (spa_lag_active(spa) ? spa_lag_wait_impl(spa) : 0);
+}
+
+static inline boolean_t
+spa_lag_free_pause(spa_t *spa)
+{
+	return (spa_lag_active(spa) ? spa_lag_free_pause_impl(spa) :
+	    B_FALSE);
+}
 
 extern char *spa_config_path;
 extern const char *zfs_deadman_failmode;

@@ -73,6 +73,7 @@
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 #ifdef ZFS_DEBUG
 #include <stdio.h>
 #endif
@@ -239,6 +240,14 @@ lzc_ioctl(zfs_ioc_t ioc, const char *name,
 		if (ioc == ZFS_IOC_CHANNEL_PROGRAM) {
 			zc.zc_nvlist_dst_size = fnvlist_lookup_uint64(source,
 			    ZCP_ARG_MEMLIMIT);
+		} else if (ioc >= ZFS_IOC_PARITY_INFO &&
+		    ioc <= ZFS_IOC_PARITY_DROP) {
+			/*
+			 * LABEL, READ, MAP and RECORDS give large replies.
+			 * A small first buffer makes the kernel do the work
+			 * twice.
+			 */
+			zc.zc_nvlist_dst_size = MAX(size * 2, 4 * 1024 * 1024);
 		} else {
 			zc.zc_nvlist_dst_size = MAX(size * 2, 128 * 1024);
 		}
@@ -2095,5 +2104,460 @@ lzc_ddt_prune(const char *pool, zpool_ddt_prune_unit_t unit, uint64_t amount)
 	fnvlist_free(args);
 	fnvlist_free(result);
 
+	return (error);
+}
+
+/*
+ * Parity set (see docs/design/interfaces.md).  Every call returns an errno.
+ * The reply of INFO, RECORDS, READ, MAP, BLOCKS and LABEL is returned in
+ * *out (free it with nvlist_free()).  LABEL also returns the reply with
+ * ESTALE.
+ */
+static int
+lzc_parity_call(zfs_ioc_t ioc, const char *pool, nvlist_t *args,
+    nvlist_t **out)
+{
+	nvlist_t *result = NULL;
+	int error = lzc_ioctl(ioc, pool, args, &result);
+
+	if (out != NULL && result != NULL &&
+	    (error == 0 || (ioc == ZFS_IOC_PARITY_LABEL && error == ESTALE))) {
+		*out = result;
+	} else {
+		fnvlist_free(result);
+		if (out != NULL)
+			*out = NULL;
+	}
+	return (error);
+}
+
+/* txg: NULL, or a txg whose root checksum the reply should carry. */
+int
+lzc_parity_info_txg(const char *pool, const uint64_t *txg, nvlist_t **out)
+{
+	nvlist_t *args = fnvlist_alloc();
+	int error;
+
+	if (txg != NULL)
+		fnvlist_add_uint64(args, ZPARITY_TXG, *txg);
+	error = lzc_parity_call(ZFS_IOC_PARITY_INFO, pool, args, out);
+	fnvlist_free(args);
+	return (error);
+}
+
+int
+lzc_parity_info(const char *pool, nvlist_t **out)
+{
+	return (lzc_parity_info_txg(pool, NULL, out));
+}
+
+int
+lzc_parity_records(const char *pool, uint64_t from_txg, uint64_t cursor,
+    uint64_t max_entries, nvlist_t **out)
+{
+	nvlist_t *args = fnvlist_alloc();
+	int error;
+
+	fnvlist_add_uint64(args, ZPARITY_FROM_TXG, from_txg);
+	fnvlist_add_uint64(args, ZPARITY_CURSOR, cursor);
+	fnvlist_add_uint64(args, ZPARITY_MAX_ENTRIES, max_entries);
+	error = lzc_parity_call(ZFS_IOC_PARITY_RECORDS, pool, args, out);
+	fnvlist_free(args);
+	return (error);
+}
+
+/* index: NULL, or the index of the entry in its record (see RECORDS). */
+int
+lzc_parity_read_index(const char *pool, const uint64_t entry[18],
+    const uint64_t *index, nvlist_t **out)
+{
+	nvlist_t *args = fnvlist_alloc();
+	int error;
+
+	fnvlist_add_uint64_array(args, ZPARITY_ENTRY, entry,
+	    ZPARITY_ENTRY_WORDS);
+	if (index != NULL)
+		fnvlist_add_uint64(args, ZPARITY_INDEX, *index);
+	error = lzc_parity_call(ZFS_IOC_PARITY_READ, pool, args, out);
+	fnvlist_free(args);
+	return (error);
+}
+
+int
+lzc_parity_read(const char *pool, const uint64_t entry[18], nvlist_t **out)
+{
+	return (lzc_parity_read_index(pool, entry, NULL, out));
+}
+
+/* indexes: NULL, or one record index for each entry. */
+int
+lzc_parity_readv(const char *pool, const uint64_t *entries, size_t nentries,
+    const uint64_t *indexes, nvlist_t **out)
+{
+	nvlist_t *args;
+	int error;
+
+	if (entries == NULL || nentries == 0 ||
+	    nentries > ZPARITY_READV_MAX_ENTRIES)
+		return (EINVAL);
+
+	args = fnvlist_alloc();
+	fnvlist_add_uint64_array(args, ZPARITY_ENTRIES, entries,
+	    nentries * ZPARITY_ENTRY_WORDS);
+	if (indexes != NULL)
+		fnvlist_add_uint64_array(args, ZPARITY_INDEXES, indexes,
+		    nentries);
+	error = lzc_parity_call(ZFS_IOC_PARITY_READV, pool, args, out);
+	fnvlist_free(args);
+	return (error);
+}
+
+int
+lzc_parity_verify_index_ex(const char *pool, const uint64_t entry[18],
+    const uint64_t *index, const void *data, size_t len, boolean_t *match,
+    boolean_t *verified)
+{
+	nvlist_t *args = fnvlist_alloc();
+	nvlist_t *out = NULL;
+	int error;
+
+	fnvlist_add_uint64_array(args, ZPARITY_ENTRY, entry,
+	    ZPARITY_ENTRY_WORDS);
+	fnvlist_add_uint8_array(args, ZPARITY_DATA, data, len);
+	if (index != NULL)
+		fnvlist_add_uint64(args, ZPARITY_INDEX, *index);
+	error = lzc_parity_call(ZFS_IOC_PARITY_VERIFY, pool, args, &out);
+	if (error == 0) {
+		if (match != NULL) {
+			*match = nvlist_exists(out, ZPARITY_MATCH) ?
+			    fnvlist_lookup_boolean_value(out, ZPARITY_MATCH) :
+			    B_FALSE;
+		}
+		if (verified != NULL) {
+			*verified = nvlist_exists(out, ZPARITY_VERIFIED) ?
+			    fnvlist_lookup_boolean_value(out,
+			    ZPARITY_VERIFIED) : B_TRUE;
+		}
+	}
+	fnvlist_free(out);
+	fnvlist_free(args);
+	return (error);
+}
+
+int
+lzc_parity_verify_index(const char *pool, const uint64_t entry[18],
+    const uint64_t *index, const void *data, size_t len, boolean_t *match)
+{
+	return (lzc_parity_verify_index_ex(pool, entry, index, data, len, match,
+	    NULL));
+}
+
+int
+lzc_parity_verify(const char *pool, const uint64_t entry[18],
+    const void *data, size_t len, boolean_t *match)
+{
+	return (lzc_parity_verify_index(pool, entry, NULL, data, len, match));
+}
+
+/*
+ * the _vdev variants name the data column (top-level vdev id) of the
+ * call; LZC_PARITY_VDEV_FIRST, and the variants without it, mean the first
+ * data column (the only one of a pool from before columns).
+ */
+static void
+lzc_parity_add_vdev(nvlist_t *args, uint64_t vdev)
+{
+	if (vdev != LZC_PARITY_VDEV_FIRST)
+		fnvlist_add_uint64(args, ZPARITY_VDEV, vdev);
+}
+
+int
+lzc_parity_map_vdev(const char *pool, uint64_t vdev, uint64_t txg,
+    uint64_t from_offset, uint64_t max_ranges, nvlist_t **out)
+{
+	nvlist_t *args = fnvlist_alloc();
+	int error;
+
+	fnvlist_add_uint64(args, ZPARITY_TXG, txg);
+	fnvlist_add_uint64(args, ZPARITY_FROM_OFFSET, from_offset);
+	fnvlist_add_uint64(args, ZPARITY_MAX_RANGES, max_ranges);
+	lzc_parity_add_vdev(args, vdev);
+	error = lzc_parity_call(ZFS_IOC_PARITY_MAP, pool, args, out);
+	fnvlist_free(args);
+	return (error);
+}
+
+int
+lzc_parity_map(const char *pool, uint64_t txg, uint64_t from_offset,
+    uint64_t max_ranges, nvlist_t **out)
+{
+	return (lzc_parity_map_vdev(pool, LZC_PARITY_VDEV_FIRST, txg,
+	    from_offset, max_ranges, out));
+}
+
+int
+lzc_parity_blocks_vdev(const char *pool, uint64_t vdev, uint64_t txg,
+    uint64_t from_offset, uint64_t max_entries, nvlist_t **out)
+{
+	nvlist_t *args = fnvlist_alloc();
+	int error;
+
+	fnvlist_add_uint64(args, ZPARITY_TXG, txg);
+	fnvlist_add_uint64(args, ZPARITY_FROM_OFFSET, from_offset);
+	fnvlist_add_uint64(args, ZPARITY_MAX_ENTRIES, max_entries);
+	lzc_parity_add_vdev(args, vdev);
+	error = lzc_parity_call(ZFS_IOC_PARITY_BLOCKS, pool, args, out);
+	fnvlist_free(args);
+	return (error);
+}
+
+int
+lzc_parity_blocks(const char *pool, uint64_t txg, uint64_t from_offset,
+    uint64_t max_entries, nvlist_t **out)
+{
+	return (lzc_parity_blocks_vdev(pool, LZC_PARITY_VDEV_FIRST, txg,
+	    from_offset, max_entries, out));
+}
+
+int
+lzc_parity_blocks_windows_vdev(const char *pool, uint64_t vdev,
+    uint64_t txg, const uint64_t *windows, uint_t nwin,
+    const uint64_t resume_in[PARITY_BLOCKS_RESUME_WORDS],
+    uint64_t max_entries, nvlist_t **out)
+{
+	nvlist_t *args;
+	uint64_t empty_window = 0;
+	int error;
+
+	if (nwin > PARITY_BLOCKS_WINDOWS_MAX ||
+	    (nwin != 0 && windows == NULL))
+		return (EINVAL);
+
+	args = fnvlist_alloc();
+	fnvlist_add_uint64(args, ZPARITY_TXG, txg);
+	fnvlist_add_uint64(args, ZPARITY_FROM_OFFSET, 0);
+	fnvlist_add_uint64(args, ZPARITY_MAX_ENTRIES, max_entries);
+	fnvlist_add_uint64_array(args, ZPARITY_WINDOWS,
+	    (windows != NULL ? windows : &empty_window), 2 * nwin);
+	if (resume_in != NULL)
+		fnvlist_add_uint64_array(args, ZPARITY_RESUME, resume_in,
+		    PARITY_BLOCKS_RESUME_WORDS);
+	lzc_parity_add_vdev(args, vdev);
+	error = lzc_parity_call(ZFS_IOC_PARITY_BLOCKS, pool, args, out);
+	fnvlist_free(args);
+	return (error);
+}
+
+int
+lzc_parity_blocks_windows(const char *pool, uint64_t txg,
+    const uint64_t *windows, uint_t nwin,
+    const uint64_t resume_in[PARITY_BLOCKS_RESUME_WORDS],
+    uint64_t max_entries, nvlist_t **out)
+{
+	return (lzc_parity_blocks_windows_vdev(pool, LZC_PARITY_VDEV_FIRST,
+	    txg, windows, nwin, resume_in, max_entries, out));
+}
+
+int
+lzc_parity_current_vdev(const char *pool, uint64_t vdev, uint64_t offset,
+    nvlist_t **out)
+{
+	nvlist_t *args = fnvlist_alloc();
+	int error;
+
+	fnvlist_add_uint64(args, ZPARITY_PHYS_OFF, offset);
+	lzc_parity_add_vdev(args, vdev);
+	error = lzc_parity_call(ZFS_IOC_PARITY_CURRENT, pool, args, out);
+	fnvlist_free(args);
+	return (error);
+}
+
+int
+lzc_parity_current(const char *pool, uint64_t offset, nvlist_t **out)
+{
+	return (lzc_parity_current_vdev(pool, LZC_PARITY_VDEV_FIRST, offset,
+	    out));
+}
+
+int
+lzc_parity_label_vdev(const char *pool, uint64_t vdev, uint64_t txg,
+    nvlist_t **out)
+{
+	nvlist_t *args = fnvlist_alloc();
+	int error;
+
+	fnvlist_add_uint64(args, ZPARITY_TXG, txg);
+	lzc_parity_add_vdev(args, vdev);
+	error = lzc_parity_call(ZFS_IOC_PARITY_LABEL, pool, args, out);
+	fnvlist_free(args);
+	return (error);
+}
+
+int
+lzc_parity_label(const char *pool, uint64_t txg, nvlist_t **out)
+{
+	return (lzc_parity_label_vdev(pool, LZC_PARITY_VDEV_FIRST, txg, out));
+}
+
+/*
+ * The explicit variants carry the set identity that the daemon owns.  The
+ * older wrappers keep their ABI and use the identity from INFO.
+ */
+int
+lzc_parity_applied_set(const char *pool, uint64_t set_guid,
+    uint64_t generation, uint64_t txg)
+{
+	nvlist_t *args = fnvlist_alloc();
+	int error;
+
+	fnvlist_add_uint64(args, ZPARITY_SET_GUID, set_guid);
+	fnvlist_add_uint64(args, ZPARITY_GENERATION, generation);
+	fnvlist_add_uint64(args, ZPARITY_TXG, txg);
+	error = lzc_parity_call(ZFS_IOC_PARITY_APPLIED, pool, args, NULL);
+	fnvlist_free(args);
+	return (error);
+}
+
+int
+lzc_parity_applied(const char *pool, uint64_t generation, uint64_t txg)
+{
+	nvlist_t *out = NULL;
+	uint64_t set_guid;
+	int error = lzc_parity_info(pool, &out);
+
+	if (error == 0) {
+		set_guid = fnvlist_lookup_uint64(out, ZPARITY_SET_GUID);
+		fnvlist_free(out);
+		return (lzc_parity_applied_set(pool, set_guid, generation,
+		    txg));
+	}
+	return (error);
+}
+
+int
+lzc_parity_repair(const char *pool, uint64_t request, const void *data,
+    size_t len, boolean_t *repaired)
+{
+	nvlist_t *args = fnvlist_alloc();
+	nvlist_t *out = NULL;
+	int error;
+
+	fnvlist_add_uint64(args, ZPARITY_REQUEST, request);
+	fnvlist_add_uint8_array(args, ZPARITY_DATA, data, len);
+	error = lzc_parity_call(ZFS_IOC_PARITY_REPAIR, pool, args, &out);
+	if (error == 0 && repaired != NULL) {
+		*repaired = nvlist_exists(out, ZPARITY_REPAIRED) ?
+		    fnvlist_lookup_boolean_value(out, ZPARITY_REPAIRED) :
+		    B_FALSE;
+	}
+	fnvlist_free(out);
+	fnvlist_free(args);
+	return (error);
+}
+
+/*
+ * Take the repair-provider role of one pool for this process's /dev/zfs
+ * handle.  Call it once for each member pool.  The role ends when the
+ * process closes the handle (at exit).
+ */
+int
+lzc_parity_provider_register(uint64_t pool_guid)
+{
+	nvlist_t *args = fnvlist_alloc();
+	int error;
+
+	fnvlist_add_uint64(args, ZPARITY_POOL_GUID, pool_guid);
+	error = lzc_ioctl(ZFS_IOC_PARITY_PROVIDER, NULL, args, NULL);
+	nvlist_free(args);
+	return (error);
+}
+
+/*
+ * Answer a waiting read that the parity service cannot rebuild the block,
+ * so that the read fails at once instead of after the wait time.
+ */
+int
+lzc_parity_repair_decline(uint64_t pool_guid, uint64_t request)
+{
+	nvlist_t *args = fnvlist_alloc();
+	int error;
+
+	fnvlist_add_uint64(args, ZPARITY_POOL_GUID, pool_guid);
+	fnvlist_add_uint64(args, ZPARITY_REQUEST, request);
+	fnvlist_add_boolean_value(args, ZPARITY_DECLINE, B_TRUE);
+	error = lzc_ioctl(ZFS_IOC_PARITY_SUPPLY, NULL, args, NULL);
+	nvlist_free(args);
+	return (error);
+}
+
+int
+lzc_parity_repair_supply(uint64_t pool_guid, uint64_t request,
+    const void *data, size_t len)
+{
+	nvlist_t *args;
+	int error;
+
+	if (data == NULL || len == 0 || len > UINT_MAX)
+		return (EINVAL);
+	args = fnvlist_alloc();
+	fnvlist_add_uint64(args, ZPARITY_POOL_GUID, pool_guid);
+	fnvlist_add_uint64(args, ZPARITY_REQUEST, request);
+	fnvlist_add_uint8_array(args, ZPARITY_DATA, data, len);
+	error = lzc_ioctl(ZFS_IOC_PARITY_SUPPLY, NULL, args, NULL);
+	nvlist_free(args);
+	return (error);
+}
+
+int
+lzc_parity_drop_set(const char *pool, uint64_t set_guid,
+    uint64_t generation)
+{
+	nvlist_t *args = fnvlist_alloc();
+	int error;
+
+	fnvlist_add_uint64(args, ZPARITY_SET_GUID, set_guid);
+	fnvlist_add_uint64(args, ZPARITY_GENERATION, generation);
+	error = lzc_parity_call(ZFS_IOC_PARITY_DROP, pool, args, NULL);
+	fnvlist_free(args);
+	return (error);
+}
+
+/*
+ * Free leaked held space.  The caller stages bounded batches of sorted
+ * ranges, then commits with the pool GUID and zdb txg.  An explicit reset
+ * discards the leaked count without freeing ranges.
+ */
+int
+lzc_parity_reclaim(const char *pool, uint64_t pool_guid, uint64_t txg,
+    uint64_t flags, const uint64_t *ranges, uint_t nranges,
+    nvlist_t **outnvl)
+{
+	nvlist_t *args = fnvlist_alloc();
+	int error;
+
+	fnvlist_add_uint64(args, ZPARITY_POOL_GUID, pool_guid);
+	fnvlist_add_uint64(args, ZPARITY_TXG, txg);
+	fnvlist_add_uint64(args, ZPARITY_RECLAIM_FLAGS, flags);
+	if (nranges != 0) {
+		fnvlist_add_uint64_array(args, ZPARITY_RANGES, ranges,
+		    nranges * 3);
+	}
+	error = lzc_parity_call(ZFS_IOC_PARITY_RECLAIM, pool, args, outnvl);
+	fnvlist_free(args);
+	return (error);
+}
+
+int
+lzc_parity_drop(const char *pool, uint64_t generation)
+{
+	nvlist_t *out = NULL;
+	uint64_t set_guid;
+	int error = lzc_parity_info(pool, &out);
+
+	if (error == 0) {
+		set_guid = fnvlist_lookup_uint64(out, ZPARITY_SET_GUID);
+		fnvlist_free(out);
+		return (lzc_parity_drop_set(pool, set_guid, generation));
+	}
 	return (error);
 }

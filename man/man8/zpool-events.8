@@ -233,6 +233,58 @@ vdev triggers the
 logic.
 This logic detects when a disk in such a vdev is significantly slower than its
 peers, and sits them out temporarily to preserve the performance of the pool.
+.It Sy parity_records
+Issued as
+.Sy sysevent.fs.zfs.parity_records
+when a transaction group that has parity records has been written to a pool
+that is a member of a parity set.
+The event wakes the parity software.
+ZFS can combine several events into one.
+The payload has
+.Sy pool_guid
+and
+.Sy txg ,
+the newest transaction group with records.
+.It Sy parity_throttle
+Issued as
+.Sy sysevent.fs.zfs.parity_throttle
+when the level of the write throttle of a parity set member changes, because
+unapplied records or held freed blocks use more or less space.
+The payload has
+.Sy pool_guid ,
+.Sy pending_bytes ,
+.Sy held_bytes
+and
+.Sy level
+.Pq Sy soft No or Sy hard .
+.It Sy parity_unprotected
+Issued as
+.Sy sysevent.fs.zfs.parity_unprotected
+when a pool with
+.Sy parity_onstall Ns = Ns Sy continue
+reaches its hard limit and drops its parity records.
+The pool is then not protected by the parity set, and the set must resync the
+pool.
+The payload has
+.Sy pool_guid .
+.It Sy parity_repair_needed
+Issued as
+.Sy sysevent.fs.zfs.parity_repair_needed
+when a read of a block of a parity set member fails with a checksum or I/O
+error on every copy of the block.
+The parity software can rebuild the block from parity and write it back.
+The payload has
+.Sy pool_guid ,
+.Sy vdev_guid ,
+.Sy request ,
+.Sy offset ,
+.Sy asize ,
+.Sy psize ,
+.Sy birth_txg ,
+.Sy cksum_type
+and
+.Sy reason
+.Pq Sy checksum No or Sy io .
 .El
 .
 .Sh PAYLOADS
@@ -427,6 +479,36 @@ Like
 but contains
 .Pq Ar good data No & ~( Ns Ar bad data ) ;
 that is, the bits set in the good data which are cleared in the bad data.
+.It Sy pending_bytes
+The space in bytes that parity records use, which the parity software has not
+applied yet.
+.It Sy held_bytes
+The space in bytes of freed blocks that ZFS holds until the parity software has
+applied the records.
+.It Sy level
+The level of the parity write throttle:
+.Sy soft
+.Pq writers are slowed
+or
+.Sy hard
+.Pq the limit of the pool is reached .
+.It Sy request
+The identifier of a repair request of a parity set member.
+.It Sy offset
+The offset in bytes of the block that needs repair.
+.It Sy asize
+The allocated size in bytes of the block that needs repair.
+.It Sy psize
+The physical size in bytes of the block that needs repair.
+.It Sy birth_txg
+The transaction group in which the block that needs repair was written.
+.It Sy cksum_type
+The checksum type of the block that needs repair.
+.It Sy reason
+Why the block needs repair:
+.Sy checksum
+or
+.Sy io .
 .El
 .
 .Sh I/O STAGES

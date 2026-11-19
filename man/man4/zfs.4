@@ -2235,6 +2235,206 @@ When enabled forces ZFS to sync data when
 flags are used allowing holes in a file to be accurately reported.
 When disabled holes will not be reported in recently dirtied files.
 .
+.It Sy zfs_parity_allow_expand Ns = Ns Sy 0 Ns | Ns 1 Pq int
+Allow online expansion of a pool that is a member of a parity set and has
+unapplied records.
+By default such an expansion is refused with the error
+.Sy ZFS_ERR_PARITY_ACTIVE ,
+because the parity disks do not cover the new space.
+The pool property
+.Sy parity_grow_max
+allows a limited expansion without this tunable, see
+.Xr zpoolprops 7 .
+.
+.It Sy zfs_parity_event_ms Ns = Ns Sy 1000 Ns ms Pq uint
+The shortest time between two
+.Sy parity_records
+events of a pool.
+.
+.It Sy zfs_parity_import_override Ns = Ns Sy 0 Ns | Ns 1 Pq uint
+Let a parity set member import read-write when its records cannot be read or
+its state is not known.
+Records stay off for that import, and ZFS does not change the records on disk.
+.Nm zpool Cm parity Cm status
+reports the pool as not protected.
+A later
+.Sy parityset Ns = Ns Sy on
+is refused until the records are dropped with
+.Nm zpool Cm parity Cm drop .
+.
+.It Sy zfs_parity_max_held_pct Ns = Ns Sy 25 Ns % Pq uint
+The default limit for the space of held freed blocks of a parity set member,
+as a percentage of the pool space.
+The pool property
+.Sy parity_max_held
+overrides this value when it is not
+.Sy 0 .
+At this limit the pool applies the
+.Sy parity_onstall
+policy.
+.
+.It Sy zfs_parity_max_record_bytes Ns = Ns Sy 4294967296 Ns B Po 4 GiB Pc Pq u64
+The default limit for the space of unapplied parity records of a pool.
+The smaller of this value and
+.Sy zfs_parity_max_record_pct
+of the pool space applies.
+The pool property
+.Sy parity_max_records
+overrides this value when it is not
+.Sy 0 .
+At this limit the pool applies the
+.Sy parity_onstall
+policy.
+.
+.It Sy zfs_parity_max_record_pct Ns = Ns Sy 5 Ns % Pq uint
+The default limit for the space of unapplied parity records of a pool, as a
+percentage of the pool space.
+The records are kept in the pool metadata in three copies, and the
+background frees of a large destroy add records in syncing context:
+this limit keeps them from filling a small pool.
+The smaller of this limit and
+.Sy zfs_parity_max_record_bytes
+applies;
+.Sy 0
+uses
+.Sy zfs_parity_max_record_bytes
+alone.
+The pool property
+.Sy parity_max_records
+overrides both when it is not
+.Sy 0 .
+.
+.It Sy zfs_parity_pace_idle_ms Ns = Ns Sy 10000 Ns ms Pq uint
+With the pool property
+.Sy parity_pace Ns = Ns Sy on ,
+writers are paced only while the parity software has reported progress
+.Pq an applied transaction group
+within this time.
+When the parity software stops, the pool uses the normal delay curve again, so
+that writers are not slowed while nothing is applied.
+.
+.It Sy zfs_parity_pace_min_pct Ns = Ns Sy 10 Ns % Pq uint
+With the pool property
+.Sy parity_pace Ns = Ns Sy on ,
+the delay of writers starts when the records or the held blocks reach this
+percentage of their limit.
+Without pacing the delay starts at
+.Sy zfs_delay_min_dirty_percent .
+.
+.It Sy zfs_parity_pace_scale Ns = Ns Sy 20000000 Ns ns Pq u64
+With the pool property
+.Sy parity_pace Ns = Ns Sy on ,
+the scale of the delay curve, as
+.Sy zfs_delay_scale
+is for dirty data.
+A larger value slows writers more at the same use of the limits, so that they
+settle at the rate of the parity software further below the limit.
+.
+.It Sy zfs_parity_release_limit Ns = Ns Sy 65536 Pq u64
+The most record entries that ZFS releases in one transaction group after the
+parity software has applied them.
+A lower value spreads the release over more transaction groups.
+.
+.It Sy zfs_parity_repair_events_per_sec Ns = Ns Sy 100 Pq uint
+The most
+.Sy parity_repair_needed
+events that a pool posts in one second.
+.
+.It Sy zfs_parity_repair_wait_ms Ns = Ns Sy 30000 Ns ms Pq uint
+The time that a failed read waits for the parity service to supply rebuilt
+bytes.
+ZFS checks the bytes against the block pointer checksum before it uses them,
+then writes them to the failed block.
+A value of
+.Sy 0
+disables the wait.
+When no provider is registered for the pool, the read is in a syncing context,
+the block is newer than the applied txg, or
+.Sy zfs_parity_repair_max_waiters
+reads of the pool already wait, the read fails at once.
+When the parity service answers that it cannot rebuild the block, the read
+fails at once.
+When the wait expires, the read fails and the repair event remains available
+for the asynchronous repair path.
+The default is 30 seconds.
+.
+.It Sy zfs_parity_repair_max_waiters Ns = Ns Sy 8 Pq uint
+The most reads of one pool that wait for the parity service at the same time.
+Each waiting read holds an I/O completion thread of the pool, so the limit
+keeps threads free for reads of good blocks.
+A read over the limit fails at once, and its repair event is still posted.
+.
+.It Sy zfs_parity_repair_max_requests Ns = Ns Sy 1024 Pq uint
+The most repair requests that a parity set member keeps.
+When the table is full, ZFS drops the oldest request.
+.
+.It Sy zfs_parity_repair_timeout_ms Ns = Ns Sy 600000 Ns ms Po 10 min Pc Pq uint
+How long a repair request stays valid.
+After this time a repair for the request is refused.
+.
+.It Sy zfs_parity_suspend_release Ns = Ns Sy 0 Ns | Ns 1 Pq int
+Test only.
+Stop the release of applied parity records, so that a test can hold the
+records and the held freed blocks for a chosen time.
+.
+.It Sy zfs_parity_test_auto_apply Ns = Ns Sy 0 Pq u64
+Test only.
+Treat the records of transaction groups that are more than this many
+transaction groups old as applied, so that a test needs no parity software.
+Each transaction group also counts as progress of the parity software for
+.Sy zfs_parity_pace_idle_ms .
+A very large value applies nothing and only counts progress.
+.Sy 0
+turns this off.
+.
+.It Sy zfs_parity_test_inject Ns = Ns Sy 0 Pq uint
+Test only.
+Inject a fault, so that a parity verifier
+.Pq see Sy zfs_parity_verify
+fires.
+The value is a bit mask:
+.Bl -tag -compact -offset 4n -width "a"
+.It Sy 1
+Skip the capture of an allocation.
+.It Sy 2
+Skip the cancel of a record that a later free voids.
+.It Sy 4
+Skip the refresh of a recorded block pointer.
+.It Sy 8
+Skip the free of a held range at its release.
+.It Sy 16
+Fail the next parity load of a set member once with
+.Er EIO ,
+so that a rewind import retries.
+The bit clears itself.
+.It Sy 32
+Fail each read of a record while it is released, so that a drop ends
+without the entries and counts their held space as leaked.
+.It Sy 64
+Hold each repair write for 3 seconds after its last check, so that a test can
+free the block while the write waits.
+.El
+.
+.It Sy zfs_parity_throttle_event_ms Ns = Ns Sy 1000 Ns ms Pq uint
+The shortest time between two
+.Sy parity_throttle
+events of a pool.
+.
+.It Sy zfs_parity_verify Ns = Ns Sy 0 Pq uint
+A bit mask of debug checks for a parity set member.
+Each check runs once for each transaction group and costs time and memory.
+Use it for tests only.
+.Bl -tag -compact -offset 4n -width "a"
+.It Sy 1
+Compare the recorded allocations with the allocations that the metaslabs show.
+.It Sy 2
+Compare the records on disk with the records in memory.
+.It Sy 4
+Compare each recorded block pointer with the block on disk.
+.It Sy 8
+Check each release of records and held freed blocks.
+.El
+.
 .It Sy zfs_pd_bytes_max Ns = Ns Sy 52428800 Ns B Po 50 MiB Pc Pq int
 The number of bytes which should be prefetched during a pool traversal, like
 .Nm zfs Cm send

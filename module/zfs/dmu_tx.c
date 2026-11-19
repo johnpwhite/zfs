@@ -28,6 +28,8 @@
 #include <sys/spa.h>
 #include <sys/brt.h>
 #include <sys/brt_impl.h>
+#include <sys/spa_impl.h>
+#include <sys/spa_lag.h>
 #include <sys/sa.h>
 #include <sys/sa_impl.h>
 #include <sys/zfs_context.h>
@@ -53,6 +55,8 @@ dmu_tx_stats_t dmu_tx_stats = {
 };
 
 static kstat_t *dmu_tx_ksp;
+
+static int dmu_tx_wait_impl(dmu_tx_t *);
 
 dmu_tx_t *
 dmu_tx_create_dd(dsl_dir_t *dd)
@@ -993,6 +997,13 @@ dmu_tx_delay(dmu_tx_t *tx, uint64_t dirty)
 		    (zfs_wrlog_data_max - wrlog), tx_time);
 	}
 
+	/*
+	 * A lagging consumer (the parity set) delays writers when its records
+	 * or its held frees near their limits.  Only writes to a dataset.
+	 */
+	if (tx->tx_objset != NULL)
+		tx_time = MAX(spa_lag_delay(dp->dp_spa), tx_time);
+
 	if (tx_time == 0)
 		return;
 
@@ -1084,6 +1095,12 @@ dmu_tx_try_assign(dmu_tx_t *tx)
 	    dsl_pool_need_dirty_delay(tx->tx_pool)) {
 		tx->tx_wait_dirty = B_TRUE;
 		DMU_TX_STAT_BUMP(dmu_tx_dirty_delay);
+		return (SET_ERROR(ERESTART));
+	}
+
+	if (!tx->tx_dirty_delayed && tx->tx_objset != NULL &&
+	    spa_lag_delay(spa) != 0) {
+		tx->tx_wait_dirty = B_TRUE;
 		return (SET_ERROR(ERESTART));
 	}
 
@@ -1299,7 +1316,7 @@ dmu_tx_assign(dmu_tx_t *tx, dmu_tx_flag_t flags)
 			if (suspended && err == ERESTART)
 				tx->tx_break_on_suspend = B_FALSE;
 			ASSERT(err == EDQUOT || err == ENOSPC ||
-			    err == ERESTART || err == EIO);
+			    err == ERESTART || err == EIO || err == EINTR);
 			return (err);
 		}
 
@@ -1322,7 +1339,15 @@ dmu_tx_assign(dmu_tx_t *tx, dmu_tx_flag_t flags)
 		if (suspended)
 			tx->tx_break_on_suspend = B_FALSE;
 
-		dmu_tx_wait(tx);
+		err = dmu_tx_wait_impl(tx);
+		if (err != 0) {
+			/*
+			 * A signal ended the wait at the hard limit of a
+			 * lagging consumer (parity_onstall=wait).
+			 */
+			ASSERT3S(err, ==, EINTR);
+			return (err);
+		}
 
 		/*
 		 * Reset tx_break_on_suspend for DMU_TX_SUSPEND. We do this
@@ -1338,12 +1363,18 @@ dmu_tx_assign(dmu_tx_t *tx, dmu_tx_flag_t flags)
 	return (0);
 }
 
-void
-dmu_tx_wait(dmu_tx_t *tx)
+/*
+ * Returns EINTR when a signal ended the wait at the hard limit of a lagging
+ * consumer (the writer must stop waiting), else 0.  Only dmu_tx_assign() can
+ * return that to its caller.
+ */
+static int
+dmu_tx_wait_impl(dmu_tx_t *tx)
 {
 	spa_t *spa = tx->tx_pool->dp_spa;
 	dsl_pool_t *dp = tx->tx_pool;
 	hrtime_t before;
+	int error = 0;
 
 	ASSERT0(tx->tx_txg);
 	ASSERT(!dsl_pool_config_held(tx->tx_pool));
@@ -1385,6 +1416,16 @@ dmu_tx_wait(dmu_tx_t *tx)
 			dp->dp_dirty_waiters--;
 			mutex_exit(&dp->dp_lock);
 		}
+		/*
+		 * At the hard limit of a lagging consumer with parity_onstall=
+		 * wait, the writer waits until the consumer has caught up.
+		 */
+		if (tx->tx_objset != NULL)
+			error = spa_lag_wait(spa);
+		if (error != 0) {
+			/* tx_wait_dirty stays set: the caller gives up. */
+			return (error);
+		}
 		dirty = dp->dp_dirty_total + dp->dp_sync_reserve_total;
 
 		dmu_tx_delay(tx, dirty);
@@ -1425,6 +1466,13 @@ dmu_tx_wait(dmu_tx_t *tx)
 	}
 
 	spa_tx_assign_add_nsecs(spa, gethrtime() - before);
+	return (0);
+}
+
+void
+dmu_tx_wait(dmu_tx_t *tx)
+{
+	(void) dmu_tx_wait_impl(tx);
 }
 
 static void

@@ -28,6 +28,7 @@
 #include <sys/vdev_draid.h>
 #include <sys/zio.h>
 #include <sys/spa_impl.h>
+#include <sys/spa_lag.h>
 #include <sys/zfeature.h>
 #include <sys/vdev_indirect_mapping.h>
 #include <sys/zap.h>
@@ -4600,6 +4601,7 @@ metaslab_sync(metaslab_t *msp, uint64_t txg)
 		    zfs_range_tree_add, msp->ms_freed);
 	}
 	msp->ms_allocated_this_txg += zfs_range_tree_space(alloctree);
+	spa_lag_verify_alloc(spa, vd, alloctree, txg);
 	zfs_range_tree_vacate(alloctree, NULL, NULL);
 
 	ASSERT0(zfs_range_tree_space(msp->ms_allocating[txg & TXG_MASK]));
@@ -6209,6 +6211,13 @@ metaslab_alloc_range(spa_t *spa, metaslab_class_t *mc, uint64_t psize,
 
 	BP_SET_BIRTH(bp, txg, 0);
 
+	/*
+	 * Every allocation passes here, so a lagging consumer (the parity set)
+	 * sees all of them.  The BP has its DVAs and its birth; the fill, the
+	 * checksum and the rest are refreshed in zio_ready().
+	 */
+	spa_lag_note_alloc(spa, bp, txg);
+
 	return (0);
 }
 
@@ -6254,7 +6263,26 @@ metaslab_free(spa_t *spa, const blkptr_t *bp, uint64_t txg, boolean_t now)
 
 	spa_config_enter(spa, SCL_FREE, FTAG, RW_READER);
 
+	uint_t held = 0;
+
+	if (now) {
+		/* The allocation is undone: drop its pending entry. */
+		spa_lag_note_unalloc(spa, bp, txg);
+	} else {
+		/*
+		 * A lagging consumer may hold some of the DVAs (bit d is DVA
+		 * d): their frees are not done yet.  It holds nothing while a
+		 * checkpoint exists: space that a checkpoint keeps must not go
+		 * back to the allocator when the hold ends.  The property sync
+		 * and the checkpoint check refuse the combination; this is the
+		 * second guard.
+		 */
+		held = checkpoint ? 0 : spa_lag_hold_free(spa, bp, txg);
+	}
+
 	for (int d = 0; d < ndvas; d++) {
+		if (held & (1U << d))
+			continue;
 		if (now) {
 			metaslab_unalloc_dva(spa, &dva[d], txg);
 		} else {
@@ -6263,6 +6291,148 @@ metaslab_free(spa_t *spa, const blkptr_t *bp, uint64_t txg, boolean_t now)
 		}
 	}
 
+	spa_config_exit(spa, SCL_FREE, FTAG);
+}
+
+/*
+ * Free a block that a lagging consumer held: every DVA of the BP, as a normal
+ * free (it goes through ms_freeing and the two-txg defer).  The hold hook in
+ * metaslab_free() is not asked.  Syncing context.
+ */
+void
+metaslab_free_held(spa_t *spa, const blkptr_t *bp)
+{
+	spa_config_enter(spa, SCL_FREE, FTAG, RW_READER);
+	for (int d = 0; d < BP_GET_NDVAS(bp); d++)
+		metaslab_free_dva(spa, &bp->blk_dva[d], B_FALSE);
+	spa_config_exit(spa, SCL_FREE, FTAG);
+}
+
+/*
+ * Debug (the parity verifier): where is a range in the freeing pipeline?  Held
+ * space must be allocated in the space map and in none of these trees, until
+ * the lagging consumer releases it.
+ *
+ * metaslab_range_freed(): any part of the range is in ms_freeing, ms_freed,
+ * ms_defer[] (or in ms_allocatable, when the metaslab is loaded).
+ * metaslab_range_freeing(): the whole range is in ms_freeing.
+ */
+static boolean_t
+metaslab_range_check(spa_t *spa, uint64_t vdev, uint64_t offset,
+    uint64_t size, boolean_t freeing_only)
+{
+	vdev_t *vd;
+	metaslab_t *msp;
+	boolean_t found = B_FALSE;
+	uint64_t os, osz;
+
+	spa_config_enter(spa, SCL_FREE, FTAG, RW_READER);
+	vd = vdev_lookup_top(spa, vdev);
+	if (vd == NULL || !vdev_is_concrete(vd) ||
+	    (offset >> vd->vdev_ms_shift) >= vd->vdev_ms_count) {
+		spa_config_exit(spa, SCL_FREE, FTAG);
+		return (B_FALSE);
+	}
+	msp = vd->vdev_ms[offset >> vd->vdev_ms_shift];
+	mutex_enter(&msp->ms_lock);
+	if (freeing_only) {
+		found = zfs_range_tree_contains(msp->ms_freeing, offset, size);
+	} else {
+		found = zfs_range_tree_find_in(msp->ms_freeing, offset, size,
+		    &os, &osz) ||
+		    zfs_range_tree_find_in(msp->ms_freed, offset, size, &os,
+		    &osz) ||
+		    (msp->ms_loaded && zfs_range_tree_find_in(
+		    msp->ms_allocatable, offset, size, &os, &osz));
+		for (int j = 0; j < TXG_DEFER_SIZE && !found; j++) {
+			found = zfs_range_tree_find_in(msp->ms_defer[j], offset,
+			    size, &os, &osz);
+		}
+	}
+	mutex_exit(&msp->ms_lock);
+	spa_config_exit(spa, SCL_FREE, FTAG);
+	return (found);
+}
+
+boolean_t
+metaslab_range_freed(spa_t *spa, uint64_t vdev, uint64_t offset, uint64_t size)
+{
+	return (metaslab_range_check(spa, vdev, offset, size, B_FALSE));
+}
+
+boolean_t
+metaslab_range_freeing(spa_t *spa, uint64_t vdev, uint64_t offset,
+    uint64_t size)
+{
+	return (metaslab_range_check(spa, vdev, offset, size, B_TRUE));
+}
+
+/*
+ * Parity set reclaim of leaked held space: is the range allocated in the space
+ * map of its metaslab, and in no tree that frees, defers, allocates or
+ * checkpoints space?  The range must lie in one metaslab of a concrete vdev
+ * that is not being removed, aligned to its ashift.  The metaslab is loaded
+ * for the test.  0, EINVAL (a bad range) or EEXIST (not allocated, or busy).
+ */
+int
+metaslab_range_allocated(spa_t *spa, uint64_t vdev, uint64_t offset,
+    uint64_t size)
+{
+	vdev_t *vd;
+	metaslab_t *msp;
+	uint64_t os, osz;
+	int error = 0;
+
+	spa_config_enter(spa, SCL_FREE, FTAG, RW_READER);
+	vd = vdev_lookup_top(spa, vdev);
+	if (vd == NULL || !vdev_is_concrete(vd) || vd->vdev_removing ||
+	    size == 0 || offset + size < offset ||
+	    P2PHASE(offset | size, 1ULL << vd->vdev_ashift) != 0 ||
+	    (offset >> vd->vdev_ms_shift) >= vd->vdev_ms_count) {
+		spa_config_exit(spa, SCL_FREE, FTAG);
+		return (SET_ERROR(EINVAL));
+	}
+	msp = vd->vdev_ms[offset >> vd->vdev_ms_shift];
+	if (offset < msp->ms_start ||
+	    offset + size > msp->ms_start + msp->ms_size) {
+		spa_config_exit(spa, SCL_FREE, FTAG);
+		return (SET_ERROR(EINVAL));
+	}
+	mutex_enter(&msp->ms_lock);
+	error = metaslab_load(msp);
+	if (error == 0 && (msp->ms_condensing ||
+	    zfs_range_tree_find_in(msp->ms_allocatable, offset, size, &os,
+	    &osz) ||
+	    zfs_range_tree_find_in(msp->ms_freeing, offset, size, &os, &osz) ||
+	    zfs_range_tree_find_in(msp->ms_freed, offset, size, &os, &osz) ||
+	    zfs_range_tree_find_in(msp->ms_checkpointing, offset, size, &os,
+	    &osz)))
+		error = SET_ERROR(EEXIST);
+	for (int j = 0; error == 0 && j < TXG_DEFER_SIZE; j++) {
+		if (zfs_range_tree_find_in(msp->ms_defer[j], offset, size,
+		    &os, &osz))
+			error = SET_ERROR(EEXIST);
+	}
+	for (int t = 0; error == 0 && t < TXG_SIZE; t++) {
+		if (zfs_range_tree_find_in(msp->ms_allocating[t], offset, size,
+		    &os, &osz))
+			error = SET_ERROR(EEXIST);
+	}
+	mutex_exit(&msp->ms_lock);
+	spa_config_exit(spa, SCL_FREE, FTAG);
+	return (error);
+}
+
+/*
+ * Free a range that metaslab_range_allocated() accepted in this txg (syncing
+ * context), as a held free is freed at its release.
+ */
+void
+metaslab_free_range(spa_t *spa, uint64_t vdev, uint64_t offset, uint64_t size)
+{
+	spa_config_enter(spa, SCL_FREE, FTAG, RW_READER);
+	metaslab_free_concrete(vdev_lookup_top(spa, vdev), offset, size,
+	    B_FALSE);
 	spa_config_exit(spa, SCL_FREE, FTAG);
 }
 
@@ -6293,6 +6463,14 @@ metaslab_claim(spa_t *spa, const blkptr_t *bp, uint64_t txg)
 	}
 
 	spa_config_exit(spa, SCL_ALLOC, FTAG);
+
+	/*
+	 * A claimed block is an allocation of the claim txg (ZIL blocks and
+	 * the data blocks of claimed WR_INDIRECT records).  The dry run
+	 * (txg == 0) and a read-only import allocate nothing.
+	 */
+	if (error == 0 && txg != 0 && spa_writeable(spa))
+		spa_lag_note_alloc(spa, bp, txg);
 
 	ASSERT(error == 0 || txg == 0);
 
@@ -6635,3 +6813,68 @@ ZFS_MODULE_PARAM(zfs_metaslab, metaslab_, trace_enabled, INT, ZMOD_RW,
 ZFS_MODULE_PARAM(zfs_metaslab, metaslab_, trace_max_entries, U64, ZMOD_RW,
 	"Maximum entries for metaslab allocation tracing");
 #endif
+
+/*
+ * Parity set (MAP ioctl): add to rt the ranges of this metaslab that are
+ * allocated.  That is the space map up to ms_synced_length, plus the unflushed
+ * allocations, minus the unflushed frees and the frees of the syncing txg that
+ * metaslab_sync() has not moved yet (ms_freeing).  It does not load the
+ * metaslab.  A held free stays allocated here until its record is released.
+ *
+ * The result is the state of the last synced txg only when no txg is syncing.
+ * While one syncs, the frees of that txg are always counted (all metaslabs),
+ * and its allocations only for a metaslab that metaslab_sync() has already
+ * handled.  The caller must not trust a range at the txg boundary then.
+ *
+ * The caller owns rt.  Ranges already in rt are replaced, so the caller can
+ * add several metaslabs.  metaslab_sync() and the flush are excluded by
+ * ms_sync_lock for the whole call, which includes the read of the space map.
+ */
+static void
+metaslab_allocated_add_cb(void *arg, uint64_t start, uint64_t size)
+{
+	zfs_range_tree_clear(arg, start, size);
+	zfs_range_tree_add(arg, start, size);
+}
+
+static void
+metaslab_allocated_clear_cb(void *arg, uint64_t start, uint64_t size)
+{
+	zfs_range_tree_clear(arg, start, size);
+}
+
+int
+metaslab_allocated_ranges(metaslab_t *msp, zfs_range_tree_t *rt)
+{
+	zfs_range_tree_t *art;
+	int error = 0;
+
+	art = zfs_range_tree_create(NULL, ZFS_RANGE_SEG64, NULL, 0, 0);
+
+	mutex_enter(&msp->ms_sync_lock);
+	mutex_enter(&msp->ms_lock);
+	space_map_t *sm = msp->ms_sm;
+	uint64_t length = msp->ms_synced_length;
+	mutex_exit(&msp->ms_lock);
+
+	if (sm != NULL)
+		error = space_map_load_length(sm, art, SM_ALLOC, length);
+
+	if (error == 0) {
+		mutex_enter(&msp->ms_lock);
+		zfs_range_tree_walk(msp->ms_unflushed_allocs,
+		    metaslab_allocated_add_cb, art);
+		zfs_range_tree_walk(msp->ms_unflushed_frees,
+		    metaslab_allocated_clear_cb, art);
+		zfs_range_tree_walk(msp->ms_freeing,
+		    metaslab_allocated_clear_cb, art);
+		mutex_exit(&msp->ms_lock);
+	}
+	mutex_exit(&msp->ms_sync_lock);
+
+	if (error == 0)
+		zfs_range_tree_walk(art, metaslab_allocated_add_cb, rt);
+	zfs_range_tree_vacate(art, NULL, NULL);
+	zfs_range_tree_destroy(art);
+	return (error);
+}

@@ -752,6 +752,29 @@ spa_remove_error(spa_t *spa, zbookmark_phys_t *zb, uint64_t birth)
 	spa_add_healed_error(spa, spa->spa_errlog_scrub, zb, birth);
 }
 
+/*
+ * A block was healed before its error reached the disk: drop it from the
+ * pending lists too, so that spa_errlog_sync() does not write it.  Used with
+ * spa_remove_error(), which handles the on-disk logs.
+ */
+void
+spa_remove_pending_error(spa_t *spa, const zbookmark_phys_t *zb)
+{
+	avl_tree_t *trees[2] = { &spa->spa_errlist_last,
+	    &spa->spa_errlist_scrub };
+	spa_error_entry_t search, *se;
+
+	search.se_bookmark = *zb;
+	mutex_enter(&spa->spa_errlist_lock);
+	for (int i = 0; i < 2; i++) {
+		if ((se = avl_find(trees[i], &search, NULL)) != NULL) {
+			avl_remove(trees[i], se);
+			kmem_free(se, sizeof (spa_error_entry_t));
+		}
+	}
+	mutex_exit(&spa->spa_errlist_lock);
+}
+
 static uint64_t
 approx_errlog_size_impl(spa_t *spa, uint64_t spa_err_obj)
 {

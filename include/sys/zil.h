@@ -624,6 +624,8 @@ typedef int zil_get_data_t(void *arg, uint64_t arg2, lr_write_t *lr, char *dbuf,
 extern int zil_parse(zilog_t *zilog, zil_parse_blk_func_t *parse_blk_func,
     zil_parse_lr_func_t *parse_lr_func, void *arg, uint64_t txg,
     boolean_t decrypt);
+extern int zil_walk_blocks(zilog_t *zilog, zil_parse_blk_func_t *blk_func,
+    void *arg);
 
 extern void	zil_init(void);
 extern void	zil_fini(void);

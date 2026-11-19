@@ -318,8 +318,13 @@ SRCS+=	abd.c \
 	spa_config.c \
 	spa_errlog.c \
 	spa_history.c \
+	spa_lag.c \
 	spa_log_spacemap.c \
 	spa_misc.c \
+	spa_parity.c \
+	spa_parity_lineage.c \
+	spa_parity_repair.c \
+	spa_parity_ioctl.c \
 	spa_stats.c \
 	txg.c \
 	u8_textprep.c \

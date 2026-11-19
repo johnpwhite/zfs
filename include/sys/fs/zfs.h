@@ -323,8 +323,20 @@ typedef enum {
 	ZPOOL_PROP_SELOG_USED,
 	ZPOOL_PROP_SELOG_EXPANDSZ,
 	ZPOOL_PROP_SELOG_FRAGMENTATION,
+	ZPOOL_PROP_PARITYSET,
+	ZPOOL_PROP_PARITY_ONSTALL,
+	ZPOOL_PROP_PARITY_MAX_RECORDS,
+	ZPOOL_PROP_PARITY_MAX_HELD,
+	ZPOOL_PROP_PARITY_GROW_MAX,
+	ZPOOL_PROP_PARITY_PACE,
 	ZPOOL_NUM_PROPS
 } zpool_prop_t;
+
+/* Values of the pool property parity_onstall. */
+typedef enum {
+	ZPOOL_PARITY_ONSTALL_CONTINUE = 0,
+	ZPOOL_PARITY_ONSTALL_WAIT
+} zpool_parity_onstall_t;
 
 /* Offsets for metaslab class properties. */
 typedef enum {
@@ -1716,6 +1728,21 @@ typedef enum zfs_ioc {
 	ZFS_IOC_POOL_PREFETCH,			/* 0x5a58 */
 	ZFS_IOC_DDT_PRUNE,			/* 0x5a59 */
 	ZFS_IOC_POOL_CONDENSE,			/* 0x5a5a */
+	ZFS_IOC_PARITY_INFO,			/* 0x5a5b */
+	ZFS_IOC_PARITY_RECORDS,			/* 0x5a5c */
+	ZFS_IOC_PARITY_READ,			/* 0x5a5d */
+	ZFS_IOC_PARITY_VERIFY,			/* 0x5a5e */
+	ZFS_IOC_PARITY_MAP,			/* 0x5a5f */
+	ZFS_IOC_PARITY_BLOCKS,			/* 0x5a60 */
+	ZFS_IOC_PARITY_LABEL,			/* 0x5a61 */
+	ZFS_IOC_PARITY_APPLIED,			/* 0x5a62 */
+	ZFS_IOC_PARITY_REPAIR,			/* 0x5a63 */
+	ZFS_IOC_PARITY_DROP,			/* 0x5a64 */
+	ZFS_IOC_PARITY_READV,			/* 0x5a65 */
+	ZFS_IOC_PARITY_CURRENT,			/* 0x5a66 */
+	ZFS_IOC_PARITY_PROVIDER,		/* 0x5a67 */
+	ZFS_IOC_PARITY_SUPPLY,			/* 0x5a68 */
+	ZFS_IOC_PARITY_RECLAIM,		/* 0x5a69 */
 
 	/*
 	 * Per-platform (Optional) - 8/128 numbers reserved.
@@ -1733,6 +1760,21 @@ typedef enum zfs_ioc {
 	ZFS_IOC_GET_BOOTENV,			/* 0x88 */
 	ZFS_IOC_LAST
 } zfs_ioc_t;
+
+/*
+ * OpenZFS ends its common ioctl allocation at POOL_CONDENSE (offset 0x5a).
+ * Keep parity ioctls after it and before the platform-specific range.
+ */
+_Static_assert(ZFS_IOC_POOL_CONDENSE - ZFS_IOC_FIRST == 0x5a,
+	"parity ioctl base no longer matches OpenZFS");
+_Static_assert(ZFS_IOC_PARITY_INFO - ZFS_IOC_FIRST == 0x5b,
+	"parity ioctl range collides with the common allocation");
+_Static_assert(ZFS_IOC_PARITY_SUPPLY - ZFS_IOC_FIRST == 0x68,
+	"parity ioctl range changed");
+_Static_assert(ZFS_IOC_PARITY_RECLAIM - ZFS_IOC_FIRST == 0x69,
+	"parity ioctl range changed");
+_Static_assert(ZFS_IOC_PARITY_RECLAIM < ZFS_IOC_FIRST + 0x80,
+	"parity ioctl range collides with platform ioctls");
 
 /*
  * zvol ioctl to get dataset name
@@ -1834,6 +1876,11 @@ typedef enum {
 	ZFS_ERR_NO_USER_NS_SUPPORT,
 	ZFS_ERR_CRYPTO_KEY_MISMATCH,
 	ZFS_ERR_RAIDZ_EXPAND_TOO_WIDE,
+	ZFS_ERR_PARITY_ACTIVE,
+	ZFS_ERR_PARITY_CHECKSUM,
+	ZFS_ERR_PARITY_SET_MISMATCH,
+	ZFS_ERR_PARITY_UNVERIFIABLE,
+	ZFS_ERR_PARITY_TOO_LARGE,
 } zfs_errno_t;
 
 /*
@@ -2010,6 +2057,102 @@ typedef enum {
 #define	DDT_PRUNE_AMOUNT	"ddt_prune_amount"
 
 /*
+ * The following are names used by the ZFS_IOC_PARITY_* ioctls.
+ */
+#define	ZPARITY_VERSION		"parity_version"
+#define	ZPARITY_VERSION_CURRENT	4
+#define	ZPARITY_VERIFIED	"verified"
+#define	ZPARITY_ENTRY_WORDS	18
+#define	ZPARITY_ENABLED		"enabled"
+#define	ZPARITY_ACTIVE		"active"
+#define	ZPARITY_STATE		"state"
+#define	ZPARITY_START_TXG	"start_txg"
+#define	ZPARITY_STOP_TXG	"stop_txg"
+#define	ZPARITY_GENERATION	"generation"
+#define	ZPARITY_SET_GUID	"set_guid"
+#define	ZPARITY_FIRST_TXG	"first_txg"
+#define	ZPARITY_LAST_TXG	"last_txg"
+#define	ZPARITY_APPLIED_TXG	"applied_txg"
+#define	ZPARITY_PENDING_BYTES	"pending_bytes"
+#define	ZPARITY_HELD_BYTES	"held_bytes"
+#define	ZPARITY_HELD_DSPACE	"held_dspace"
+#define	ZPARITY_LEAKED_BYTES	"leaked_bytes"
+#define	ZPARITY_RECORD_BYTES	"record_bytes"
+#define	ZPARITY_MAX_RECORD_BYTES	"max_record_bytes"
+#define	ZPARITY_MAX_HELD_BYTES	"max_held_bytes"
+#define	ZPARITY_NRECS		"nrecs"
+#define	ZPARITY_THROTTLE	"throttle"
+#define	ZPARITY_UNPROTECTED	"unprotected"
+#define	ZPARITY_OLDEST_TXG	"oldest_txg"
+#define	ZPARITY_OLDEST_AGE	"oldest_age"
+#define	ZPARITY_POOL_GUID	"pool_guid"
+#define	ZPARITY_VDEV_GUID	"vdev_guid"
+#define	ZPARITY_VDEV_PATH	"vdev_path"
+#define	ZPARITY_ASIZE		"asize"
+#define	ZPARITY_PHYS_OFF	"phys_off"
+#define	ZPARITY_DEV_SIZE	"dev_size"
+#define	ZPARITY_FROM_TXG	"from_txg"
+#define	ZPARITY_CURSOR		"cursor"
+#define	ZPARITY_MAX_ENTRIES	"max_entries"
+#define	ZPARITY_ENTRIES		"entries"
+#define	ZPARITY_INDEXES		"indexes"
+#define	ZPARITY_INDEX		"index"
+#define	ZPARITY_DONE		"done"
+#define	ZPARITY_ENTRY		"entry"
+#define	ZPARITY_DATA		"data"
+#define	ZPARITY_READ_ERRORS	"read_errors"
+#define	ZPARITY_DATA_OFFSETS	"data_offsets"
+#define	ZPARITY_DATA_LENGTHS	"data_lengths"
+#define	ZPARITY_READV_MAX_ENTRIES	256
+#define	ZPARITY_READV_MAX_BYTES	(32ULL * 1024 * 1024)
+#define	ZPARITY_FOUND		"found"
+#define	ZPARITY_MATCH		"match"
+#define	ZPARITY_TXG		"txg"
+#define	ZPARITY_FROM_OFFSET	"from_offset"
+/* the data column (top-level vdev id) of MAP, BLOCKS, CURRENT, LABEL */
+#define	ZPARITY_VDEV		"vdev"
+#define	ZPARITY_MAX_RANGES	"max_ranges"
+#define	ZPARITY_WINDOWS		"windows"
+#define	ZPARITY_RESUME		"resume"
+#define	ZPARITY_BLOCKS_WALKS	"blocks_walks"
+#define	PARITY_BLOCKS_WINDOWS_MAX	4096
+#define	PARITY_BLOCKS_RESUME_WORDS	5
+#define	ZPARITY_RANGES		"ranges"
+#define	ZPARITY_RECLAIMED	"reclaimed_bytes"
+#define	ZPARITY_RECLAIM_FLAGS	"reclaim_flags"
+#define	ZPARITY_RECLAIM_STAGED	"staged_ranges"
+#define	ZPARITY_RECLAIM_STAGE	0x1
+#define	ZPARITY_RECLAIM_COMMIT	0x2
+#define	ZPARITY_RECLAIM_ABORT	0x4
+#define	ZPARITY_RECLAIM_RESET	0x8
+#define	ZPARITY_NEXT_OFFSET	"next_offset"
+#define	ZPARITY_LABEL		"label"
+#define	ZPARITY_UB_TXG		"ub_txg"
+#define	ZPARITY_UB_SLOT		"ub_slot"
+#define	ZPARITY_UB_OFFSETS	"ub_offsets"
+#define	ZPARITY_REQUEST		"request"
+#define	ZPARITY_REPAIRED	"repaired"
+#define	ZPARITY_DECLINE		"decline"
+#define	ZPARITY_EPOCH		"epoch"
+#define	ZPARITY_LINEAGE_TXG	"lineage_txg"
+#define	ZPARITY_LINEAGE_CKSUM	"lineage_cksum"
+#define	ZPARITY_REWOUND		"rewound"
+#define	ZPARITY_DATA_VDEV	"data_vdev"
+#define	ZPARITY_DATA_LEAF_GUID	"data_leaf_guid"
+#define	ZPARITY_TXG_CKSUM	"txg_cksum"
+#define	ZPARITY_REPAIR_PENDING	"repair_pending"
+/* the data columns (top-level vdevs) of a member pool */
+#define	ZPARITY_COLUMNS		"columns"
+#define	ZPARITY_COL_VDEV	"vdev"
+#define	ZPARITY_COL_GUID	"guid"
+#define	ZPARITY_COL_TYPE	"type"
+#define	ZPARITY_COL_ASHIFT	"ashift"
+#define	ZPARITY_COL_LEAF_GUIDS	"leaf_guids"
+#define	ZPARITY_COL_LEAF_PATHS	"leaf_paths"
+#define	ZPARITY_COL_LEAF_SIZES	"leaf_sizes"
+#define	ZPARITY_COL_LEAF_INSYNC	"leaf_insync"
+
+/*
  * Flags for ZFS_IOC_VDEV_SET_STATE
  */
 #define	ZFS_ONLINE_CHECKREMOVE	0x1
@@ -2031,6 +2174,7 @@ typedef enum {
 #define	ZFS_IMPORT_SKIP_MMP	0x20
 #define	ZFS_IMPORT_LOAD_KEYS	0x40
 #define	ZFS_IMPORT_CHECKPOINT	0x80
+#define	ZFS_IMPORT_PARITY_OVERRIDE	0x100
 
 /*
  * Channel program argument/return nvlist keys and defaults.

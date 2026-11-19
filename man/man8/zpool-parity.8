@@ -1,0 +1,347 @@
+.\" SPDX-License-Identifier: CDDL-1.0
+.\"
+.\" This file and its contents are supplied under the terms of the
+.\" Common Development and Distribution License ("CDDL"), version 1.0.
+.\" You may only use this file in accordance with the terms of version
+.\" 1.0 of the CDDL.
+.\"
+.\" A full copy of the text of the CDDL should have accompanied this
+.\" source.  A copy of the CDDL is also available via the Internet at
+.\" https://opensource.org/license/CDDL-1.0.
+.\"
+.\" Copyright (c) 2026 John White. All rights reserved.
+.\"
+.Dd November 19, 2026
+.Dt ZPOOL-PARITY 8
+.Os
+.
+.Sh NAME
+.Nm zpool-parity
+.Nd show or discard the parity records of a ZFS storage pool, or reclaim leaked space
+.Sh SYNOPSIS
+.Nm zpool
+.Cm parity
+.Cm status
+.Op Fl Hp
+.Op Ar pool
+.Nm zpool
+.Cm parity
+.Cm drop
+.Op Fl f
+.Ar pool
+.Nm zpool
+.Cm parity
+.Cm reclaim
+.Ar pool
+.Op Ar zdb-output
+.Nm zpool
+.Cm parity
+.Cm reclaim
+.Fl r
+.Ar pool
+.
+.Sh DESCRIPTION
+A parity set is a group of independent single-disk pools that share lagging
+parity disks.
+Each pool in the set stays a normal pool.
+It imports and reads alone on any host that supports its features, without the
+parity disks and without any parity software.
+.Pp
+A pool becomes a member of the set when its
+.Sy parityset
+property is
+.Sy on .
+The pool then keeps records of the blocks that it allocates and frees, and
+it holds each freed block until the user-space daemon
+.Nm zparityd
+has applied the change to the parity disks.
+The parity lags the writes: a write never waits for the parity, unless the pool
+reaches a limit and
+.Sy parity_onstall
+is
+.Sy wait .
+The records use the
+.Sy parity_records
+feature.
+See
+.Xr zpoolprops 7
+and
+.Xr zpool-features 7 .
+.Pp
+Parity accepts a rebuilt block only if its bytes pass the checksum of the block.
+A block that has no checksum cannot pass.
+Therefore a member pool refuses
+.Sy checksum Ns = Ns Sy off
+on its datasets.
+For a block that was written with
+.Sy checksum Ns = Ns Sy off
+before the pool joined the set, the parity software gets the bytes marked as not
+verified, and the pool refuses to verify or to repair that block.
+See
+.Xr zpoolprops 7 .
+.Pp
+A replace of the disk of a member, and the start of a hot spare in its place,
+is always a sequential rebuild, as with
+.Nm zpool Cm replace Fl s ,
+also when
+.Fl s
+is not given.
+The parity software works on raw bytes, so the new disk must hold every range
+that the space maps call allocated.
+A healing resilver copies only the live blocks.
+It misses the held freed blocks, and the blocks that wait to be freed after the
+destroy of a snapshot or of a dataset.
+A sequential rebuild copies all of them.
+The pool then starts a scrub, which checks the live blocks.
+The replace fails if the
+.Sy device_rebuild
+feature is not enabled.
+.Pp
+This parity is not the parity of a
+.Sy raidz
+vdev.
+.Nm zpool Cm status
+shows the parity of
+.Sy raidz
+vdevs only.
+.Pp
+To arm a pool that was rebuilt from parity before its first write, import it
+with
+.Nm zpool Cm import Fl o Sy parityset Ns = Ns Sy on .
+A read-only import loads the records so that
+.Nm zpool Cm parity Cm status
+can show them, but it never writes.
+.Bl -tag -width Ds
+.It Xo
+.Nm zpool
+.Cm parity
+.Cm status
+.Op Fl Hp
+.Op Ar pool
+.Xc
+Displays the parity state of
+.Ar pool ,
+or of all imported pools if no pool is given.
+The output shows:
+.Bl -tag -compact -offset 4n -width "applied_txg"
+.It Sy state
+.Sy off ,
+.Sy on ,
+.Sy draining
+.Pq the property is Sy off No but records remain ,
+or
+.Sy dropping
+.Pq the records are being discarded .
+.It Sy applied_txg
+The newest transaction group that the parity disks hold.
+.It Sy pending_bytes
+The space of the records that are not applied yet.
+.It Sy held_bytes
+The space of the freed blocks that ZFS holds until the records are applied.
+.It Sy max_held_bytes
+The limit of
+.Sy held_bytes
+in force
+.Pq Sy parity_max_held .
+.It Sy record_bytes
+The space of the record objects that are not applied yet.
+.It Sy max_record_bytes
+The limit of
+.Sy record_bytes
+in force
+.Pq Sy parity_max_records .
+The write throttle starts when either use nears its limit.
+.It Sy leaked_bytes
+The space of held blocks that a drop could not free, because the record that
+names them was unreadable.
+The count stays after the records are gone.
+ZFS cannot reuse this space;
+.Nm zdb Fl b
+reports it as leaked.
+To get it back, use
+.Nm zpool Cm parity Cm reclaim .
+.El
+.Pp
+If the pool dropped its records at the hard limit, because of
+.Sy parity_onstall Ns = Ns Sy continue ,
+the output shows
+.Qq not protected, resync needed .
+.Bl -tag -width Ds
+.It Fl H
+Scripted mode.
+Do not display headers, and separate fields by a single tab instead of
+arbitrary white space.
+Each line has a field name, a tab and the value.
+.It Fl p
+Display numbers in parseable
+.Pq exact
+values.
+.El
+.It Xo
+.Nm zpool
+.Cm parity
+.Cm drop
+.Op Fl f
+.Ar pool
+.Xc
+Discards all parity records of
+.Ar pool
+and releases all held freed blocks now.
+The parity set must then resync the pool before the parity covers it again.
+If
+.Sy parityset
+is
+.Sy on ,
+a new set of records starts.
+If it is
+.Sy off ,
+the pool leaves the set.
+.Pp
+The command prints a warning and asks for a confirmation unless
+.Fl f
+is given.
+A signal can interrupt the wait for the end of the drop.
+The drop then goes on.
+.Bl -tag -width Ds
+.It Fl f
+Do not ask for a confirmation.
+.El
+.It Xo
+.Nm zpool
+.Cm parity
+.Cm reclaim
+.Ar pool zdb-output
+.Xc
+or
+.Xo
+.Nm zpool
+.Cm parity
+.Cm reclaim
+.Fl r
+.Ar pool
+.Xc
+Frees the space that
+.Sy leaked_bytes
+counts.
+The ranges come from
+.Nm zdb ,
+which finds space that is allocated and that no block pointer and no parity
+record names.
+Export the pool, then run
+.Nm zdb Fl e Fl b Ar pool
+and save its output.
+The output has a reclaim header with the pool GUID, the uberblock txg, and
+the error count.
+Import the pool again and pass the output file to this command.
+Use
+.Fl -
+to read the output from standard input.
+The command uploads bounded batches and frees all ranges in one transaction.
+.Pp
+ZFS frees nothing unless all checks pass:
+the header has no errors and names this pool, its txg is the state that the
+import loaded, each range is allocated, no parity record holds a part of it,
+and the sum of the ranges equals
+.Sy leaked_bytes .
+An empty list is an error.
+.Pp
+The
+.Fl r
+form explicitly resets the leaked-space count without freeing any ranges.
+Use it only when you accept that the leaked space will stay allocated and
+unavailable.
+.El
+.
+.Sh STATISTICS
+While a pool has parity state, ZFS publishes it in the kstat
+.Pa /proc/spl/kstat/zfs/ Ns Ar pool Ns Pa /parity_set
+on Linux, and in
+.Sy kstat.zfs . Ns Ar pool Ns Sy .misc.parity_set
+on
+.Fx .
+The values are read at the time of the read; no service is needed.
+The kstat goes away when the pool is exported.
+.Bl -tag -width "max_record_bytes"
+.It Sy state
+0 off, 1 on, 2 draining, 3 dropping.
+.It Sy generation , set_guid
+The parity record generation and the set that the pool belongs to.
+.It Sy start_txg
+The txg in which recording started.
+.It Sy applied_txg , synced_txg
+The last txg that the service applied, and the last txg that the pool synced.
+.It Sy lag_txgs
+.Sy synced_txg
+minus
+.Sy applied_txg
+while recording is on, else 0.
+.It Sy first_txg , last_txg , records
+The oldest and newest txg with records that are not yet released, and their
+number.
+.It Sy pending_bytes , pending_txgs
+Allocated bytes, and txgs, that the service has not applied yet.
+.It Sy held_bytes , record_bytes
+Freed space that is held until it is applied, and the space of the records.
+.It Sy max_record_bytes , max_held_bytes
+The limits in force for the write throttle.
+.It Sy leaked_bytes
+Held space that a drop could not free; see
+.Nm zpool Cm parity reclaim .
+.It Sy throttle
+0 none, 1 soft (writers are delayed), 2 hard.
+.It Sy throttled_ms
+The time in milliseconds at the soft or hard level since the pool was loaded.
+.It Sy applied_age_ms
+The time in milliseconds since the service last applied a txg or reported
+progress; 0 when it has not done so since the pool was loaded.
+.It Sy unprotected , drop_pending
+1 when records were lost and the set must resync the pool, and 1 while a drop
+is pending.
+.It Sy record_txgs , entries , released , drops
+Counts since the pool was loaded: txgs that wrote records, record entries,
+records released, and drops.
+.It Sy repair_requests
+Blocks that failed their checksum and asked the service for their bytes.
+.It Sy repair_supplied , repair_declined , repair_rejected
+Answers of the service to a read that waited: bytes taken, no bytes, and bytes
+that failed the block checksum (also for
+.Sy REPAIR ) .
+.It Sy repair_written
+Blocks that a
+.Sy REPAIR
+call wrote back.
+.El
+.
+.Sh EXIT STATUS
+.Ex -std zpool parity
+.
+.Sh EXAMPLES
+.Ss Example 1 : No Add a pool to a parity set
+Set the property.
+Records start a few transactions later.
+.Dl # Nm zpool Cm set Sy parityset Ns = Ns Sy on Ar tank
+.Dl # Nm zpool Cm parity status Ar tank
+.
+.Ss Example 2 : No Remove a pool from a parity set
+Set the property to
+.Sy off ,
+wait until the parity software has applied the records, and check the state.
+.Dl # Nm zpool Cm set Sy parityset Ns = Ns Sy off Ar tank
+.Dl # Nm zpool Cm parity status Ar tank
+If the parity software is not running, discard the records.
+.Dl # Nm zpool Cm parity Cm drop Fl f Ar tank
+.
+.Ss Example 3 : No Reclaim the space that a drop leaked
+.Dl # Nm zpool Cm export Ar tank
+.Dl # Nm zdb Fl e Fl b Ar tank > Pa /tmp/leaks
+.Dl # Nm zpool Cm import Ar tank
+.Dl # Nm zpool Cm parity Cm reclaim Ar tank Pa /tmp/leaks
+.
+.Sh SEE ALSO
+.Xr zfs 4 ,
+.Xr zpool-features 7 ,
+.Xr zpoolprops 7 ,
+.Xr zdb 8 ,
+.Xr zpool-events 8 ,
+.Xr zpool-set 8 ,
+.Xr zpool-status 8

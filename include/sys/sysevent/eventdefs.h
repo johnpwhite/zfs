@@ -119,6 +119,10 @@ extern "C" {
 #define	ESC_ZFS_ERRORSCRUB_ABORT	"errorscrub_abort"
 #define	ESC_ZFS_ERRORSCRUB_RESUME	"errorscrub_resume"
 #define	ESC_ZFS_ERRORSCRUB_PAUSED	"errorscrub_paused"
+#define	ESC_ZFS_PARITY_THROTTLE		"parity_throttle"
+#define	ESC_ZFS_PARITY_UNPROTECTED	"parity_unprotected"
+#define	ESC_ZFS_PARITY_RECORDS		"parity_records"
+#define	ESC_ZFS_PARITY_REPAIR_NEEDED	"parity_repair_needed"
 
 /*
  * datalink subclass definitions.

@@ -24,6 +24,8 @@
 #include <sys/zfs_context.h>
 #include <sys/zfs_chksum.h>
 #include <sys/spa_impl.h>
+#include <sys/spa_lag.h>
+#include <sys/spa_parity.h>
 #include <sys/zio.h>
 #include <sys/zio_checksum.h>
 #include <sys/zio_compress.h>
@@ -836,6 +838,7 @@ spa_add(const char *name, nvlist_t *config, const char *altroot)
 	mutex_init(&spa->spa_activities_lock, NULL, MUTEX_DEFAULT, NULL);
 	mutex_init(&spa->spa_txg_log_time_lock, NULL, MUTEX_DEFAULT, NULL);
 	mutex_init(&spa->spa_condense_stats_lock, NULL, MUTEX_DEFAULT, NULL);
+	mutex_init(&spa->spa_parity_reclaim_lock, NULL, MUTEX_DEFAULT, NULL);
 
 	cv_init(&spa->spa_async_cv, NULL, CV_DEFAULT, NULL);
 	cv_init(&spa->spa_evicting_os_cv, NULL, CV_DEFAULT, NULL);
@@ -962,6 +965,7 @@ spa_remove(spa_t *spa)
 	ASSERT3U(zfs_refcount_count(&spa->spa_refcount), ==, 0);
 	ASSERT0(spa->spa_waiters);
 	ASSERT0(spa->spa_stats_holds);
+	spa_parity_reclaim_clear(spa);
 
 	nvlist_free(spa->spa_config_splitting);
 
@@ -1030,6 +1034,7 @@ spa_remove(spa_t *spa)
 	mutex_destroy(&spa->spa_activities_lock);
 	mutex_destroy(&spa->spa_txg_log_time_lock);
 	mutex_destroy(&spa->spa_condense_stats_lock);
+	mutex_destroy(&spa->spa_parity_reclaim_lock);
 
 	kmem_free(spa, sizeof (spa_t));
 }
@@ -2144,6 +2149,16 @@ spa_update_dspace(spa_t *spa)
 		ASSERT3U(spa->spa_rdspace, >=, spa->spa_nonallocating_dspace);
 		spa->spa_rdspace -= spa->spa_nonallocating_dspace;
 	}
+
+	/*
+	 * Space that a lagging consumer holds (frees that are not done yet) is
+	 * not available.  Leaked parity frees stay allocated until reclaim.
+	 * The DSL sees ENOSPC before it can reuse either range.
+	 */
+	uint64_t held = spa_lag_held_dspace(spa);
+	spa->spa_rdspace -= MIN(held, spa->spa_rdspace);
+	uint64_t leaked = spa_parity_leaked_bytes(spa);
+	spa->spa_rdspace -= MIN(leaked, spa->spa_rdspace);
 	spa->spa_dspace = spa->spa_rdspace +
 	    metaslab_class_get_dalloc(spa_special_class(spa)) +
 	    metaslab_class_get_dalloc(spa_dedup_class(spa)) +
@@ -2897,6 +2912,8 @@ spa_init(spa_mode_t mode)
 	brt_init();
 	ddt_init();
 	zio_init();
+	spa_parity_init();
+	spa_parity_repair_global_init();
 	dmu_init();
 	zil_init();
 	vdev_mirror_stat_init();
@@ -2924,6 +2941,8 @@ spa_fini(void)
 	chksum_fini();
 	zil_fini();
 	dmu_fini();
+	spa_parity_repair_global_fini();
+	spa_parity_fini();
 	zio_fini();
 	ddt_fini();
 	brt_fini();

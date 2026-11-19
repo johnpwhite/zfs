@@ -618,3 +618,43 @@ zio_checksum_templates_free(spa_t *spa)
 		}
 	}
 }
+
+/*
+ * Check a buffer against a block pointer, or an embedded label checksum, for
+ * a caller that has no zio (the parity set ioctls).  zio_checksum_error_impl()
+ * reads only io_spa and io_bp (and io_private when there is no bp and the
+ * checksum is not embedded), so a zeroed zio that holds these is enough.  The
+ * bp can be NULL for a label checksum.  size is the size the checksum covers.
+ */
+int
+zio_checksum_verify_bp(spa_t *spa, const blkptr_t *bp,
+    enum zio_checksum checksum, abd_t *abd, uint64_t size, uint64_t offset)
+{
+	zio_t *zio = kmem_zalloc(sizeof (zio_t), KM_SLEEP);
+	int error;
+
+	zio->io_spa = spa;
+	zio->io_bp = (blkptr_t *)bp;
+	zio->io_offset = offset;
+	error = zio_checksum_error_impl(zio, checksum, abd, size, offset,
+	    NULL);
+	kmem_free(zio, sizeof (zio_t));
+	return (error);
+}
+
+/*
+ * Compute the embedded label checksum of a buffer that will be written at
+ * physical offset "offset" (the verifier is the offset).
+ */
+void
+zio_checksum_compute_label(spa_t *spa, abd_t *abd, uint64_t size,
+    uint64_t offset)
+{
+	zio_t *zio = kmem_zalloc(sizeof (zio_t), KM_SLEEP);
+
+	zio->io_spa = spa;
+	zio->io_bp = NULL;
+	zio->io_offset = offset;
+	zio_checksum_compute(zio, ZIO_CHECKSUM_LABEL, abd, size);
+	kmem_free(zio, sizeof (zio_t));
+}

@@ -964,6 +964,7 @@ typedef struct spa_stats {
 	spa_history_kstat_t	iostats;
 	spa_history_kstat_t	log_spacemaps;
 	spa_history_kstat_t	misc;
+	spa_history_kstat_t	parity_set;	/* parity set member */
 } spa_stats_t;
 
 typedef enum txg_state {
@@ -1244,6 +1245,7 @@ extern void spa_log_error(spa_t *spa, const zbookmark_phys_t *zb,
     const uint64_t birth);
 extern void spa_remove_error(spa_t *spa, zbookmark_phys_t *zb,
     uint64_t birth);
+extern void spa_remove_pending_error(spa_t *spa, const zbookmark_phys_t *zb);
 extern int zfs_ereport_post(const char *clazz, spa_t *spa, vdev_t *vd,
     const zbookmark_phys_t *zb, zio_t *zio, uint64_t state);
 extern boolean_t zfs_ereport_is_valid(const char *clazz, spa_t *spa, vdev_t *vd,
