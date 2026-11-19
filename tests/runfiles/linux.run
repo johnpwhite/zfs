@@ -27,6 +27,14 @@ tests = ['posix_001_pos', 'posix_002_pos', 'posix_003_pos',
     'posix_004_pos', 'posix_005_pos']
 tags = ['functional', 'acl', 'posix']
 
+[tests/functional/parity_set:Linux]
+tests = ['parity_cols_eligible_pos', 'parity_cols_eligible_neg',
+    'parity_cols_add_pos', 'parity_cols_add_neg', 'parity_cols_attach_pos',
+    'parity_cols_degraded_pos', 'parity_cols_rebuild_read_neg',
+    'parity_cols_split_neg', 'parity_cols_info_pos',
+    'parity_cols_label_pos', 'parity_repair_mirror_pos']
+tags = ['functional', 'parity_set']
+
 [tests/functional/acl/posix-sa:Linux]
 tests = ['posix_001_pos', 'posix_002_pos', 'posix_003_pos', 'posix_004_pos']
 tags = ['functional', 'acl', 'posix-sa']

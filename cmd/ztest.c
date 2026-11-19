@@ -105,6 +105,9 @@
 #include <sys/vdev_raidz.h>
 #include <sys/vdev_trim.h>
 #include <sys/spa_impl.h>
+#include <sys/spa_parity.h>
+#include <sys/spa_parity_impl.h>
+#include <sys/dmu_traverse.h>
 #include <sys/mmp.h>
 #include <sys/metaslab_impl.h>
 #include <sys/dsl_prop.h>
@@ -204,6 +207,7 @@ typedef struct ztest_shared_opts {
 	uint64_t zo_fishing_seed[4];
 	int zo_gvars_count;
 	char zo_gvars[ZO_GVARS_MAX_COUNT][ZO_GVARS_MAX_ARGLEN];
+	int zo_parity;		/* last: keeps the layout of upstream (-B) */
 } ztest_shared_opts_t;
 
 /* Default values for command line options. */
@@ -454,6 +458,7 @@ ztest_func_t ztest_fletcher_incr;
 ztest_func_t ztest_verify_dnode_bt;
 ztest_func_t ztest_pool_prefetch_ddt;
 ztest_func_t ztest_ddt_prune;
+ztest_func_t ztest_parity_dedup_copies;
 ztest_func_t ztest_spa_log_flushall_start;
 ztest_func_t ztest_spa_log_flushall_cancel;
 ztest_func_t ztest_scrub_prefetch;
@@ -510,6 +515,7 @@ static ztest_info_t ztest_info[] = {
 	ZTI_INIT(ztest_verify_dnode_bt, 1, &zopt_sometimes),
 	ZTI_INIT(ztest_pool_prefetch_ddt, 1, &zopt_rarely),
 	ZTI_INIT(ztest_ddt_prune, 1, &zopt_rarely),
+	ZTI_INIT(ztest_parity_dedup_copies, 1, &zopt_sometimes),
 	ZTI_INIT(ztest_spa_log_flushall_start, 1, &zopt_rarely),
 	ZTI_INIT(ztest_spa_log_flushall_cancel, 1, &zopt_rarely),
 	ZTI_INIT(ztest_scrub_prefetch, 1, &zopt_rarely),
@@ -546,6 +552,39 @@ typedef struct ztest_shared {
 	uint64_t	zs_metaslab_sz;
 	uint64_t	zs_metaslab_df_alloc_threshold;
 	uint64_t	zs_guid;
+	/*
+	 * Parity set consumer (-Z).  This state lives here, and not in the
+	 * process, so that a killed pass does not lose it: the shadow image
+	 * is a file, and these fields say which txg it holds.
+	 */
+	uint64_t	zs_parity_valid;	/* the shadow holds an epoch */
+	uint64_t	zs_parity_gen;		/* generation of that epoch */
+	uint64_t	zs_parity_start;	/* start txg of that epoch */
+	uint64_t	zs_parity_consumed;	/* records up to it are in it */
+	uint64_t	zs_parity_label_txg;	/* newest record txg in it */
+	uint64_t	zs_parity_off;		/* parityset was turned off */
+	uint64_t	zs_parity_small;	/* small limits are set */
+	uint64_t	zs_parity_applied;	/* last txg we called APPLIED */
+	uint64_t	zs_parity_applies;
+	uint64_t	zs_parity_forced;	/* APPLIED with SPA_LAG_FORCE */
+	uint64_t	zs_parity_stale;	/* APPLIED with an old txg */
+	uint64_t	zs_parity_drops;	/* DROPs we asked for */
+	uint64_t	zs_parity_epochs;	/* epoch changes not ours */
+	uint64_t	zs_parity_toggles;	/* parityset off or on */
+	uint64_t	zs_parity_throttled;	/* rounds that saw a throttle */
+	uint64_t	zs_parity_unprot;	/* rounds with unprotected */
+	uint64_t	zs_parity_reads;	/* READ calls */
+	uint64_t	zs_parity_unverified;	/* unverified ALLOC reads */
+	uint64_t	zs_parity_read_skips;	/* READ calls abandoned */
+	uint64_t	zs_parity_inits;	/* shadow images started */
+	uint64_t	zs_parity_rb_pass;	/* rebuild checks passed */
+	uint64_t	zs_parity_rb_skip;	/* rebuild checks skipped */
+	uint64_t	zs_parity_rb_blocks;	/* blocks the checks read */
+	uint64_t	zs_parity_ro_pass;	/* read-only checks passed */
+	uint64_t	zs_parity_init_skips;	/* shadow starts refused */
+	uint64_t	zs_parity_finals;	/* passes that ran the final */
+	uint64_t	zs_parity_dd_runs;	/* dedup + copies cases run */
+	uint64_t	zs_parity_dd_wide;	/* a dedup hit added DVAs */
 } ztest_shared_t;
 
 #define	ID_PARALLEL	-1ULL
@@ -798,6 +837,9 @@ static ztest_option_t option_table[] = {
 	    NO_DEFAULT, NULL},
 	{ 'C',	"vdev-class-state", "on|off|random", "vdev class state",
 	    NO_DEFAULT, "random"},
+	{ 'Z',	"parity", NULL,
+	    "Parity set mode: one file vdev, parityset=on, consumer, rebuild",
+	    NO_DEFAULT, NULL},
 	{ 'X', "raidz-expansion", NULL,
 	    "Perform a dedicated raidz expansion test",
 	    NO_DEFAULT, NULL},
@@ -1245,6 +1287,9 @@ process_options(int argc, char **argv)
 		case 'X':
 			zo->zo_raidz_expand_test = RAIDZ_EXPAND_REQUESTED;
 			break;
+		case 'Z':
+			zo->zo_parity = 1;
+			break;
 		case 'E':
 			zo->zo_init = 0;
 			break;
@@ -1322,6 +1367,20 @@ process_options(int argc, char **argv)
 	}
 
 	fini_options();
+
+	/*
+	 * Parity set mode (-Z): a single file vdev, no raidz, no mirrors, and
+	 * the debug verifier of the parity set on (a -o option can
+	 * override it).
+	 */
+	if (zo->zo_parity) {
+		zo->zo_vdevs = 1;
+		zo->zo_mirrors = 0;
+		zo->zo_raid_children = 1;
+		zo->zo_raidz_expand_test = RAIDZ_EXPAND_NONE;
+		zo->zo_mmp_test = 0;
+		raid_kind = "raidz";
+	}
 
 	/* Force compatible options for raidz expansion run */
 	if (zo->zo_raidz_expand_test == RAIDZ_EXPAND_REQUESTED) {
@@ -3448,6 +3507,10 @@ void
 ztest_spa_checkpoint_create_discard(ztest_ds_t *zd, uint64_t id)
 {
 	(void) zd, (void) id;
+	/* Not in parity set mode: one vdev, no checkpoint, no guid change. */
+	if (ztest_opts.zo_parity)
+		return;
+
 	spa_t *spa = ztest_spa;
 
 	mutex_enter(&ztest_checkpoint_lock);
@@ -3492,6 +3555,10 @@ void
 ztest_vdev_add_remove(ztest_ds_t *zd, uint64_t id)
 {
 	(void) zd, (void) id;
+	/* Not in parity set mode: one vdev, no checkpoint, no guid change. */
+	if (ztest_opts.zo_parity)
+		return;
+
 	ztest_shared_t *zs = ztest_shared;
 	spa_t *spa = ztest_spa;
 	uint64_t leaves;
@@ -3584,6 +3651,10 @@ void
 ztest_vdev_class_add(ztest_ds_t *zd, uint64_t id)
 {
 	(void) zd, (void) id;
+	/* Not in parity set mode: one vdev, no checkpoint, no guid change. */
+	if (ztest_opts.zo_parity)
+		return;
+
 	ztest_shared_t *zs = ztest_shared;
 	spa_t *spa = ztest_spa;
 	uint64_t leaves;
@@ -3779,6 +3850,10 @@ void
 ztest_split_pool(ztest_ds_t *zd, uint64_t id)
 {
 	(void) zd, (void) id;
+	/* Not in parity set mode: one vdev, no checkpoint, no guid change. */
+	if (ztest_opts.zo_parity)
+		return;
+
 	ztest_shared_t *zs = ztest_shared;
 	spa_t *spa = ztest_spa;
 	vdev_t *rvd = spa->spa_root_vdev;
@@ -3932,6 +4007,10 @@ ztest_vdev_attach_detach(ztest_ds_t *zd, uint64_t id)
 	 * Decide whether to do an attach or a replace.
 	 */
 	replacing = ztest_random(2);
+
+	/* A parity set member stays one disk during a replacement. */
+	if (ztest_opts.zo_parity)
+		replacing = 1;
 
 	/*
 	 * Pick a random top-level vdev.
@@ -4269,6 +4348,10 @@ void
 ztest_vdev_raidz_attach(ztest_ds_t *zd, uint64_t id)
 {
 	(void) zd, (void) id;
+	/* Not in parity set mode: one vdev, no checkpoint, no guid change. */
+	if (ztest_opts.zo_parity)
+		return;
+
 	ztest_shared_t *zs = ztest_shared;
 	spa_t *spa = ztest_spa;
 	uint64_t leaves, raidz_children, newsize, ashift = ztest_get_ashift();
@@ -4388,6 +4471,10 @@ void
 ztest_device_removal(ztest_ds_t *zd, uint64_t id)
 {
 	(void) zd, (void) id;
+	/* Not in parity set mode: one vdev, no checkpoint, no guid change. */
+	if (ztest_opts.zo_parity)
+		return;
+
 	spa_t *spa = ztest_spa;
 	vdev_t *vd;
 	uint64_t guid;
@@ -4565,6 +4652,10 @@ void
 ztest_vdev_LUN_growth(ztest_ds_t *zd, uint64_t id)
 {
 	(void) zd, (void) id;
+	/* Not in parity set mode: one vdev, no checkpoint, no guid change. */
+	if (ztest_opts.zo_parity)
+		return;
+
 	spa_t *spa = ztest_spa;
 	vdev_t *vd, *tvd;
 	metaslab_class_t *mc;
@@ -6628,6 +6719,14 @@ ztest_fault_inject(ztest_ds_t *zd, uint64_t id)
 	mutex_enter(&ztest_vdev_lock);
 
 	/*
+	 * A parity set member is one disk with no redundancy: damage that
+	 * is injected here cannot be repaired, and the consumer would
+	 * (rightly) report it as a bad block.
+	 */
+	if (ztest_opts.zo_parity)
+		goto out;
+
+	/*
 	 * Device removal is in progress, fault injection must be disabled
 	 * until it completes and the pool is scrubbed.  The fault injection
 	 * strategy for damaging blocks does not take in to account evacuated
@@ -6972,6 +7071,10 @@ void
 ztest_reguid(ztest_ds_t *zd, uint64_t id)
 {
 	(void) zd, (void) id;
+	/* Not in parity set mode: one vdev, no checkpoint, no guid change. */
+	if (ztest_opts.zo_parity)
+		return;
+
 	spa_t *spa = ztest_spa;
 	uint64_t orig, load;
 	int error;
@@ -7629,6 +7732,115 @@ ztest_ddt_prune(ztest_ds_t *zd, uint64_t id)
 }
 
 /*
+ * Parity set mode: a dedup block whose DVAs have different births.
+ * Write a block with dedup and copies=1, let a txg (and perhaps an APPLIED
+ * of the consumer thread) pass, then write the same bytes again with more
+ * copies: the dedup hit adds DVAs in a later txg.  Then free the blocks
+ * at a random point, or keep them.  The kernel must hold or cancel the free
+ * of each DVA by its own birth; the consumer's shadow and the rebuild check
+ * at the end of the pass find a wrong choice.
+ */
+void
+ztest_parity_dedup_copies(ztest_ds_t *zd, uint64_t id)
+{
+	ztest_shared_t *zs = ztest_shared;
+	const uint64_t bs = 4096;
+	ztest_od_t *od;
+	dmu_buf_t *db;
+	blkptr_t bp;
+	uint64_t copies, pattern, when;
+	uint64_t *buf;
+	int error;
+
+	if (!ztest_opts.zo_parity)
+		return;
+
+	od = kmem_alloc(sizeof (ztest_od_t), KM_SLEEP);
+	ztest_od_init(od, id, FTAG, 0, DMU_OT_UINT64_OTHER, bs, 0, 0);
+	if (ztest_object_init(zd, od, sizeof (ztest_od_t), B_FALSE) != 0) {
+		kmem_free(od, sizeof (ztest_od_t));
+		return;
+	}
+
+	/* Bytes that no other block has: the first write is not a hit. */
+	buf = kmem_alloc(bs, KM_SLEEP);
+	pattern = ztest_random(-1ULL) | 1;
+	for (uint64_t i = 0; i < bs / sizeof (uint64_t); i++)
+		buf[i] = pattern ^ (i * 0x9e3779b97f4a7c15ULL) ^ id;
+
+	(void) pthread_rwlock_rdlock(&ztest_name_lock);
+	error = ztest_dsl_prop_set_uint64(zd->zd_name, ZFS_PROP_DEDUP,
+	    ZIO_CHECKSUM_SHA256, B_FALSE);
+	if (error == 0)
+		error = ztest_dsl_prop_set_uint64(zd->zd_name,
+		    ZFS_PROP_COPIES, 1, B_FALSE);
+	(void) pthread_rwlock_unlock(&ztest_name_lock);
+	if (error != 0)
+		goto out;
+
+	(void) pthread_rwlock_rdlock(&zd->zd_zilog_lock);
+	error = ztest_write(zd, od->od_object, 0, bs, buf);
+	(void) pthread_rwlock_unlock(&zd->zd_zilog_lock);
+	if (error != 0)
+		goto out;
+	txg_wait_synced(dmu_objset_pool(zd->zd_os), 0);
+
+	/* Give the consumer thread a chance to apply the first txg. */
+	if (ztest_random(2) == 0)
+		(void) poll(NULL, 0, 100 + ztest_random(1500));
+
+	/*
+	 * More copies: the hit on the same bytes writes the missing DVAs
+	 * now.  Another thread can change the property again, so the
+	 * result is checked below and only counted.
+	 */
+	copies = 2 + ztest_random(2);
+	(void) pthread_rwlock_rdlock(&ztest_name_lock);
+	error = ztest_dsl_prop_set_uint64(zd->zd_name, ZFS_PROP_COPIES,
+	    copies, B_FALSE);
+	(void) pthread_rwlock_unlock(&ztest_name_lock);
+	if (error != 0)
+		goto out;
+
+	(void) pthread_rwlock_rdlock(&zd->zd_zilog_lock);
+	error = ztest_write(zd, od->od_object, bs, bs, buf);
+	(void) pthread_rwlock_unlock(&zd->zd_zilog_lock);
+	if (error != 0)
+		goto out;
+	txg_wait_synced(dmu_objset_pool(zd->zd_os), 0);
+	atomic_inc_64(&zs->zs_parity_dd_runs);
+
+	if (dmu_buf_hold(zd->zd_os, od->od_object, bs, FTAG, &db,
+	    DMU_READ_NO_PREFETCH) == 0) {
+		dmu_buf_impl_t *dbi = (dmu_buf_impl_t *)db;
+		db_lock_type_t dblt = dmu_buf_lock_parent(dbi, RW_READER, FTAG);
+
+		BP_ZERO(&bp);
+		if (dbi->db_blkptr != NULL)
+			bp = *dbi->db_blkptr;
+		dmu_buf_unlock_parent(dbi, dblt, FTAG);
+		dmu_buf_rele(db, FTAG);
+		if (!BP_IS_HOLE(&bp) && BP_GET_DEDUP(&bp) &&
+		    BP_GET_NDVAS(&bp) > 1)
+			atomic_inc_64(&zs->zs_parity_dd_wide);
+	}
+
+	/* Free both blocks now, after another APPLIED, or never. */
+	when = ztest_random(3);
+	if (when != 0) {
+		if (when == 1)
+			(void) poll(NULL, 0, 100 + ztest_random(1500));
+		(void) pthread_rwlock_rdlock(&zd->zd_zilog_lock);
+		(void) ztest_truncate(zd, od->od_object, 0, 2 * bs);
+		(void) pthread_rwlock_unlock(&zd->zd_zilog_lock);
+	}
+
+out:
+	kmem_free(buf, bs);
+	kmem_free(od, sizeof (ztest_od_t));
+}
+
+/*
  * Verify pool integrity by running zdb.
  */
 static void
@@ -7791,6 +8003,1635 @@ ztest_spa_import_export(char *oldname, char *newname)
 	spa_close(spa, FTAG);
 
 	fnvlist_free(config);
+}
+
+/*
+ * Parity set mode (-Z): the consumer and the shadow rebuild.
+ *
+ * A member pool of a parity set records every allocation and holds every
+ * free until a consumer says "applied".  In production the consumer is the
+ * parity daemon.  Here a thread of ztest plays that part on the in-kernel
+ * functions behind the ioctls (spa_parity_ioc_*), and keeps a "shadow": a
+ * file with the bytes that the pool had at the newest txg it consumed.
+ *
+ * Each round of the consumer:
+ *  - starts a shadow when there is none for the epoch.  The shadow begins as
+ *    a copy of the allocated space at start_txg - 1 (MAP) taken from the
+ *    device file, with the release of frees paused;
+ *  - reads the records after the consumed txg (RECORDS), READs every entry
+ *    that is not a log block (a hold that failed shows as ECKSUM here), puts
+ *    the bytes of an ALLOC in the shadow and zeros for a FREE;
+ *  - calls APPLIED with a random txg that is not newer than the consumed
+ *    one (old txgs too, and FORCE or not), sometimes DROP, sometimes turns
+ *    parityset off and on, and sometimes sets small limits (throttle).
+ *
+ * The consumer never applies a txg that it has not put in the shadow, and it
+ * reads each entry before it applies the txg of that entry.  So the shadow
+ * is an exact copy of the member as of the consumed txg, and can be killed
+ * at any point: a record that is read twice writes the same bytes twice.
+ *
+ * At the end of a pass (ztest_parity_final) the pool is stopped, the last
+ * records are consumed and the label of that txg is taken (LABEL).  Then:
+ *  - the pool is exported and imported read-only, the read-only calls are
+ *    made, and the device file must not change at all;
+ *  - the shadow, with that label, is imported as a pool (read-only) and
+ *    every block that a traversal finds must pass its checksum.  That is the
+ *    promise of the parity set: the rebuilt disk is a consistent pool at the
+ *    applied txg.
+ */
+
+#define	ZTEST_PARITY_ENTRIES	2048	/* RECORDS entries in one call */
+#define	ZTEST_PARITY_CHUNK	(1ULL << 20)
+
+/* The shadow image: a file with the layout of the device file. */
+static int ztest_parity_fd = -1;
+static uint64_t ztest_parity_phys_off;	/* start of the data on the device */
+
+typedef struct ztest_parity_info {
+	boolean_t	zpi_member;	/* state is on or draining */
+	boolean_t	zpi_dropping;
+	boolean_t	zpi_draining;
+	boolean_t	zpi_throttled;
+	boolean_t	zpi_unprotected;
+	uint64_t	zpi_generation;
+	uint64_t	zpi_set_guid;
+	uint64_t	zpi_start_txg;
+	uint64_t	zpi_stop_txg;	/* last txg with ALLOCs, or 0 */
+	uint64_t	zpi_applied_txg;
+	uint64_t	zpi_nrecs;
+	uint64_t	zpi_held_bytes;
+	uint64_t	zpi_phys_off;
+	char		*zpi_path;	/* MAXPATHLEN bytes, kmem */
+} ztest_parity_info_t;
+
+static void
+ztest_parity_path(char *buf, size_t len, const char *what)
+{
+	(void) snprintf(buf, len, "%s/%s.%s", ztest_opts.zo_dir,
+	    ztest_opts.zo_pool, what);
+}
+
+static uint64_t
+ztest_parity_nv_u64(nvlist_t *nv, const char *name)
+{
+	uint64_t v = 0;
+
+	(void) nvlist_lookup_uint64(nv, name, &v);
+	return (v);
+}
+
+/* A snapshot of INFO.  Returns the error of the call. */
+static int
+ztest_parity_get_info(spa_t *spa, ztest_parity_info_t *zi)
+{
+	nvlist_t *nv = fnvlist_alloc();
+	const char *s = "off";
+	char *p = zi->zpi_path;
+	int error;
+
+	memset(zi, 0, sizeof (*zi));
+	zi->zpi_path = p;
+	p[0] = '\0';
+	error = spa_parity_ioc_info(spa, B_FALSE, 0, nv);
+	if (error != 0) {
+		fnvlist_free(nv);
+		return (error);
+	}
+	(void) nvlist_lookup_string(nv, ZPARITY_STATE, &s);
+	zi->zpi_member = (strcmp(s, "on") == 0 || strcmp(s, "draining") == 0);
+	zi->zpi_dropping = (strcmp(s, "dropping") == 0);
+	zi->zpi_draining = (strcmp(s, "draining") == 0);
+	s = "none";
+	(void) nvlist_lookup_string(nv, ZPARITY_THROTTLE, &s);
+	zi->zpi_throttled = (strcmp(s, "none") != 0);
+	zi->zpi_unprotected = fnvlist_lookup_boolean_value(nv,
+	    ZPARITY_UNPROTECTED);
+	zi->zpi_generation = ztest_parity_nv_u64(nv, ZPARITY_GENERATION);
+	zi->zpi_set_guid = ztest_parity_nv_u64(nv, ZPARITY_SET_GUID);
+	zi->zpi_start_txg = ztest_parity_nv_u64(nv, ZPARITY_START_TXG);
+	zi->zpi_stop_txg = ztest_parity_nv_u64(nv, ZPARITY_STOP_TXG);
+	zi->zpi_applied_txg = ztest_parity_nv_u64(nv, ZPARITY_APPLIED_TXG);
+	zi->zpi_nrecs = ztest_parity_nv_u64(nv, ZPARITY_NRECS);
+	zi->zpi_held_bytes = ztest_parity_nv_u64(nv, ZPARITY_HELD_BYTES);
+	zi->zpi_phys_off = ztest_parity_nv_u64(nv, ZPARITY_PHYS_OFF);
+	s = NULL;
+	if (nvlist_lookup_string(nv, ZPARITY_VDEV_PATH, &s) == 0 && s != NULL)
+		(void) strlcpy(zi->zpi_path, s, MAXPATHLEN);
+	fnvlist_free(nv);
+	return (0);
+}
+
+static uint64_t
+ztest_parity_set_guid(spa_t *spa, const ztest_parity_info_t *zi)
+{
+	uint64_t guid = zi->zpi_set_guid;
+
+	if (guid == 0)
+		guid = spa_guid(spa);
+	return (guid != 0 ? guid : 1);
+}
+
+/* Check the parity record format after the workers have stopped. */
+static void
+ztest_parity_check_format(spa_t *spa)
+{
+	spa_lag_t *lag = spa_parity_lag(spa);
+	spa_lag_rec_t *lr;
+	uint64_t dir[SPA_LAG_DIR_WORDS];
+
+	if (lag == NULL)
+		return;
+	/*
+	 * The directory is made with the first record (or a set GUID) and
+	 * removed with the last one: with no record there may be none.
+	 */
+	int err = spa_lag_dir_read(spa->spa_meta_objset, PARITY_DIR_NAME, dir);
+	if (err == ENOENT) {
+		spa_lag_recs_hold(lag);
+		VERIFY3P(spa_lag_rec_first(lag), ==, NULL);
+		spa_lag_recs_rele(lag);
+		return;
+	}
+	VERIFY0(err);
+	VERIFY3U(dir[SLD_VERSION], ==, SPA_LAG_VERSION);
+	for (uint_t i = SPA_LAG_DIR_RESERVED_START;
+	    i < SPA_LAG_DIR_WORDS; i++)
+		VERIFY0(dir[i]);
+
+	spa_lag_recs_hold(lag);
+	lr = spa_lag_rec_first(lag);
+	if (lr != NULL) {
+		VERIFY3U(lr->lr_phys.pr_version, ==, SPA_LAG_VERSION);
+		VERIFY3U(lr->lr_phys.pr_time, >, 0);
+		for (uint_t i = 0; i < ARRAY_SIZE(lr->lr_phys.pr_reserved); i++)
+			VERIFY0(lr->lr_phys.pr_reserved[i]);
+	}
+	spa_lag_recs_rele(lag);
+}
+
+static void
+ztest_parity_close(void)
+{
+	if (ztest_parity_fd != -1) {
+		(void) close(ztest_parity_fd);
+		ztest_parity_fd = -1;
+	}
+}
+
+/* Forget the shadow: a new pool, or an epoch that we cannot follow. */
+static void
+ztest_parity_invalidate(void)
+{
+	ztest_shared_t *zs = ztest_shared;
+
+	zs->zs_parity_valid = 0;
+	zs->zs_parity_consumed = 0;
+	zs->zs_parity_label_txg = 0;
+	ztest_parity_close();
+}
+
+/* A new pool has no shadow: remove the file of an older run. */
+static void
+ztest_parity_reset(void)
+{
+	char *path = kmem_alloc(MAXPATHLEN, KM_SLEEP);
+
+	ztest_parity_invalidate();
+	ztest_parity_path(path, MAXPATHLEN, "shadow");
+	(void) unlink(path);
+	kmem_free(path, MAXPATHLEN);
+}
+
+/* Open the shadow of the epoch that the shared state describes. */
+static int
+ztest_parity_open(const ztest_parity_info_t *zi)
+{
+	char *path;
+
+	if (ztest_parity_fd != -1)
+		return (0);
+	path = kmem_alloc(MAXPATHLEN, KM_SLEEP);
+	ztest_parity_path(path, MAXPATHLEN, "shadow");
+	ztest_parity_fd = open(path, O_RDWR);
+	kmem_free(path, MAXPATHLEN);
+	if (ztest_parity_fd == -1)
+		return (errno);
+	ztest_parity_phys_off = zi->zpi_phys_off;
+	return (0);
+}
+
+static void
+ztest_parity_shadow_write(uint64_t off, const void *buf, uint64_t len)
+{
+	ssize_t n = pwrite(ztest_parity_fd, buf, len,
+	    ztest_parity_phys_off + off);
+
+	if (n != (ssize_t)len)
+		fatal(B_TRUE, "parity shadow: pwrite(%llu, %llu) returned %d",
+		    (u_longlong_t)off, (u_longlong_t)len, (int)n);
+}
+
+static void
+ztest_parity_shadow_zero(uint64_t off, uint64_t len)
+{
+	uint64_t done = 0;
+	void *zeros = kmem_zalloc(ZTEST_PARITY_CHUNK, KM_SLEEP);
+
+	while (done < len) {
+		uint64_t c = MIN(len - done, ZTEST_PARITY_CHUNK);
+
+		ztest_parity_shadow_write(off + done, zeros, c);
+		done += c;
+	}
+	kmem_free(zeros, ZTEST_PARITY_CHUNK);
+}
+
+/*
+ * Start the shadow of the current epoch: the allocated space of the member
+ * at start_txg - 1, copied from the device file.  The release of frees is
+ * paused, so that no range of the map can be freed and reused during the
+ * copy.  Returns an error if the map is not possible (yet).
+ */
+static int
+ztest_parity_start_shadow(spa_t *spa, const ztest_parity_info_t *zi)
+{
+	ztest_shared_t *zs = ztest_shared;
+	spa_lag_t *lag = spa_parity_lag(spa);
+	uint64_t txg = zi->zpi_start_txg - 1;
+	uint64_t from = 0;
+	boolean_t done = B_FALSE;
+	struct stat st;
+	char *path;
+	void *buf;
+	int dfd, error = 0;
+
+	if (lag == NULL || zi->zpi_start_txg == 0 || zi->zpi_path[0] == '\0' ||
+	    txg > spa_last_synced_txg(spa))
+		return (EAGAIN);
+
+	dfd = open(zi->zpi_path, O_RDONLY);
+	if (dfd == -1)
+		return (errno);
+	if (fstat(dfd, &st) != 0) {
+		error = errno;
+		(void) close(dfd);
+		return (error);
+	}
+
+	ztest_parity_close();
+	path = kmem_alloc(MAXPATHLEN, KM_SLEEP);
+	ztest_parity_path(path, MAXPATHLEN, "shadow");
+	ztest_parity_fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+	if (ztest_parity_fd == -1 ||
+	    ftruncate(ztest_parity_fd, st.st_size) != 0)
+		fatal(B_TRUE, "parity shadow: cannot create %s", path);
+	kmem_free(path, MAXPATHLEN);
+	ztest_parity_phys_off = zi->zpi_phys_off;
+
+	buf = kmem_alloc(ZTEST_PARITY_CHUNK, KM_SLEEP);
+	spa_lag_pause_release(lag);
+	while (!done && error == 0) {
+		nvlist_t *out = fnvlist_alloc();
+		uint64_t *r;
+		uint_t n = 0;
+
+		error = spa_parity_ioc_map(spa, SPA_PARITY_VDEV_FIRST, txg,
+		    from, 4096, out);
+		if (error == 0) {
+			uint64_t next;
+
+			r = fnvlist_lookup_uint64_array(out, ZPARITY_RANGES,
+			    &n);
+			for (uint_t i = 0; i + 1 < n; i += 2) {
+				for (uint64_t o = 0; o < r[i + 1];
+				    o += ZTEST_PARITY_CHUNK) {
+					uint64_t c = MIN(r[i + 1] - o,
+					    ZTEST_PARITY_CHUNK);
+					uint64_t at = zi->zpi_phys_off +
+					    r[i] + o;
+
+					if (pread(dfd, buf, c, at) !=
+					    (ssize_t)c) {
+						fatal(B_TRUE, "parity shadow: "
+						    "pread(%llu, %llu)",
+						    (u_longlong_t)at,
+						    (u_longlong_t)c);
+					}
+					ztest_parity_shadow_write(r[i] + o,
+					    buf, c);
+				}
+			}
+			done = fnvlist_lookup_boolean_value(out, ZPARITY_DONE);
+			next = fnvlist_lookup_uint64(out, ZPARITY_NEXT_OFFSET);
+			if (!done && next <= from && n == 0)
+				error = EIO;
+			from = next;
+		}
+		fnvlist_free(out);
+	}
+	spa_lag_resume_release(lag);
+	kmem_free(buf, ZTEST_PARITY_CHUNK);
+	(void) close(dfd);
+
+	if (error != 0) {
+		ztest_parity_invalidate();
+		return (error);
+	}
+	zs->zs_parity_valid = 1;
+	zs->zs_parity_gen = zi->zpi_generation;
+	zs->zs_parity_start = zi->zpi_start_txg;
+	zs->zs_parity_consumed = txg;
+	zs->zs_parity_label_txg = 0;
+	zs->zs_parity_inits++;
+	if (ztest_opts.zo_verbose >= 5) {
+		(void) printf("parity: shadow started at txg %llu, "
+		    "epoch %llu\n", (u_longlong_t)txg,
+		    (u_longlong_t)zi->zpi_generation);
+	}
+	return (0);
+}
+
+/* Does the shadow still describe the epoch of the pool? */
+static boolean_t
+ztest_parity_same_epoch(spa_t *spa)
+{
+	ztest_shared_t *zs = ztest_shared;
+	ztest_parity_info_t zi;
+	boolean_t same;
+
+	zi.zpi_path = kmem_alloc(MAXPATHLEN, KM_SLEEP);
+	if (ztest_parity_get_info(spa, &zi) != 0 || !zi.zpi_member)
+		same = B_FALSE;
+	else
+		same = (zi.zpi_generation == zs->zs_parity_gen &&
+		    zi.zpi_start_txg == zs->zs_parity_start);
+	kmem_free(zi.zpi_path, MAXPATHLEN);
+	return (same);
+}
+
+/*
+ * A READ failed in a stable epoch: say what is on the device, and whether
+ * the other copies of the block pass.
+ */
+static void
+ztest_parity_read_diag(spa_t *spa, const uint64_t *w, const uint64_t *index)
+{
+	const blkptr_t *bp = (const blkptr_t *)&w[PARITY_EW_BP];
+	uint64_t ew[PARITY_ENTRY_WORDS];
+	ztest_parity_info_t zi;
+	uint64_t head[4] = { 0 };
+	int fd;
+
+	zi.zpi_path = kmem_alloc(MAXPATHLEN, KM_SLEEP);
+	if (ztest_parity_get_info(spa, &zi) == 0 && zi.zpi_path[0] != '\0' &&
+	    (fd = open(zi.zpi_path, O_RDONLY)) != -1) {
+		for (int d = 0; d < SPA_DVAS_PER_BP; d++) {
+			uint64_t o;
+			nvlist_t *out;
+			int e;
+
+			if (DVA_GET_ASIZE(&bp->blk_dva[d]) == 0)
+				continue;
+			o = DVA_GET_OFFSET(&bp->blk_dva[d]);
+			out = fnvlist_alloc();
+			memcpy(ew, w, sizeof (ew));
+			ew[PARITY_EW_KIND] = (ew[PARITY_EW_KIND] &
+			    ~(0xffffULL << 16)) | ((uint64_t)d << 16);
+			e = spa_parity_ioc_read(spa, ew, PARITY_ENTRY_WORDS,
+			    index, out);
+			fnvlist_free(out);
+			if (pread(fd, head, sizeof (head),
+			    zi.zpi_phys_off + o) != (ssize_t)sizeof (head))
+				memset(head, 0, sizeof (head));
+			(void) printf("parity diag: DVA %d at %llu: READ %d, "
+			    "device %016llx %016llx %016llx %016llx\n", d,
+			    (u_longlong_t)o, e, (u_longlong_t)head[0],
+			    (u_longlong_t)head[1], (u_longlong_t)head[2],
+			    (u_longlong_t)head[3]);
+		}
+		(void) close(fd);
+	}
+	(void) fflush(stdout);
+	kmem_free(zi.zpi_path, MAXPATHLEN);
+}
+
+static boolean_t
+ztest_parity_alloc_no_checksum(const blkptr_t *bp)
+{
+	enum zio_checksum cksum = BP_GET_CHECKSUM(bp);
+
+	return (cksum == ZIO_CHECKSUM_OFF || cksum == ZIO_CHECKSUM_NOPARITY);
+}
+
+static boolean_t
+ztest_parity_alloc_unverified(const blkptr_t *bp)
+{
+	return (ZIO_CHECKSUM_IS_ZERO(&bp->blk_cksum) ||
+	    ztest_parity_alloc_no_checksum(bp));
+}
+
+/*
+ * Read one entry of a record, check it and put it in the shadow.  Returns
+ * 0, or an error that says the entry went away (a DROP or a new epoch).
+ * A block that does not pass its checksum is a failure of the hold or of
+ * the record, and stops ztest.
+ */
+static int
+ztest_parity_apply_entry(spa_t *spa, const uint64_t *w, const uint64_t *index,
+    boolean_t shadow)
+{
+	ztest_shared_t *zs = ztest_shared;
+	uint64_t kind = w[PARITY_EW_KIND] & 0xff;
+	uint64_t flags = (w[PARITY_EW_KIND] >> 8) & 0xff;
+	uint64_t dva = (w[PARITY_EW_KIND] >> 16) & 0xff;
+	uint64_t len = (w[PARITY_EW_KIND] >> 32) << SPA_MINBLOCKSHIFT;
+	const blkptr_t *bp = (const blkptr_t *)&w[PARITY_EW_BP];
+	uint64_t off = DVA_GET_OFFSET(&bp->blk_dva[dva]);
+	nvlist_t *out;
+	int error;
+
+	/* A log block is not protected: the rebuilt disk has none. */
+	if ((flags & 1) != 0)
+		return (0);
+	ASSERT(kind == PARITY_KIND_ALLOC || kind == PARITY_KIND_FREE);
+
+	out = fnvlist_alloc();
+	error = spa_parity_ioc_read(spa, w, PARITY_ENTRY_WORDS, index, out);
+	if (error == 0) {
+		if (kind == PARITY_KIND_ALLOC) {
+			uint8_t *data;
+			uint_t n;
+			boolean_t verified;
+
+			verified = fnvlist_lookup_boolean_value(out,
+			    ZPARITY_VERIFIED);
+			if (!verified) {
+				if (!ztest_parity_alloc_unverified(bp))
+					fatal(B_FALSE,
+					    "parity: ALLOC read %llu",
+					    (u_longlong_t)w[PARITY_EW_TXG]);
+				zs->zs_parity_unverified++;
+			}
+
+			data = fnvlist_lookup_uint8_array(out, ZPARITY_DATA,
+			    &n);
+			VERIFY3U(n, ==, len);
+			if (shadow)
+				ztest_parity_shadow_write(off, data, len);
+		} else if (shadow) {
+			ztest_parity_shadow_zero(off, len);
+		}
+		zs->zs_parity_reads++;
+	} else if (error == ECKSUM || error == EIO) {
+		/* A DROP can free the block under a READ: look again. */
+		if (!ztest_parity_same_epoch(spa)) {
+			zs->zs_parity_read_skips++;
+			error = ESTALE;
+		} else {
+			char blkbuf[BP_SPRINTF_LEN];
+
+			ztest_parity_read_diag(spa, w, index);
+			snprintf_blkptr(blkbuf, sizeof (blkbuf), bp);
+			fatal(B_FALSE, "parity READ of a %s entry failed with "
+			    "%d: txg %llu, offset %llu, length %llu, flags "
+			    "%llu, dva %llu, consumed %llu, applied %llu: %s",
+			    kind == PARITY_KIND_ALLOC ? "ALLOC" : "FREE",
+			    error, (u_longlong_t)w[PARITY_EW_TXG],
+			    (u_longlong_t)off, (u_longlong_t)len,
+			    (u_longlong_t)flags, (u_longlong_t)dva,
+			    (u_longlong_t)zs->zs_parity_consumed,
+			    (u_longlong_t)zs->zs_parity_applied, blkbuf);
+		}
+	} else {
+		zs->zs_parity_read_skips++;
+	}
+	fnvlist_free(out);
+	return (error);
+}
+
+/*
+ * Consume the records after the consumed txg.  With "drain" it goes on until
+ * there are none left; else at most a few calls.  The consumed txg moves
+ * only over txgs that are complete in the shadow.
+ *
+ * In a drain ("stop" is not 0) the records after the stop txg hold only the
+ * FREEs of older blocks: their ALLOCs are not recorded.  So the shadow stays
+ * the pool at the stop txg: those entries are read but not put in the
+ * shadow, and the label txg does not pass the stop txg.  Before, the shadow
+ * took those FREEs, and the rebuild check imported an image of a txg after
+ * the stop with the newest blocks missing.
+ */
+static int
+ztest_parity_consume(spa_t *spa, boolean_t drain, uint64_t stop)
+{
+	ztest_shared_t *zs = ztest_shared;
+	uint64_t from = zs->zs_parity_consumed + 1;
+	uint64_t cursor = 0;
+	uint64_t cur = 0, prev = 0;
+	int calls = 0, error = 0;
+	boolean_t done = B_FALSE;
+
+	while (!done && error == 0) {
+		nvlist_t *out = fnvlist_alloc();
+		uint64_t *ents, *idx;
+		uint_t nw = 0, ni = 0;
+		uint64_t max = ztest_random(4) == 0 ?
+		    3 + ztest_random(40) : ZTEST_PARITY_ENTRIES;
+
+		error = spa_parity_ioc_records(spa, from, cursor, max, out);
+		if (error != 0) {
+			fnvlist_free(out);
+			break;
+		}
+		ents = fnvlist_lookup_uint64_array(out, ZPARITY_ENTRIES, &nw);
+		idx = fnvlist_lookup_uint64_array(out, ZPARITY_INDEXES, &ni);
+		cursor = fnvlist_lookup_uint64(out, ZPARITY_CURSOR);
+		done = fnvlist_lookup_boolean_value(out, ZPARITY_DONE);
+		VERIFY3U(nw, ==, ni * PARITY_ENTRY_WORDS);
+
+		for (uint_t i = 0; i < ni && error == 0; i++) {
+			const uint64_t *w = &ents[i * PARITY_ENTRY_WORDS];
+
+			if (w[PARITY_EW_TXG] != cur) {
+				if (cur != 0)
+					prev = cur;
+				cur = w[PARITY_EW_TXG];
+			}
+			error = ztest_parity_apply_entry(spa, w, &idx[i],
+			    stop == 0 || w[PARITY_EW_TXG] <= stop);
+		}
+		fnvlist_free(out);
+		if (error != 0)
+			break;
+
+		if (done) {
+			/* Every record up to the last one is in the shadow. */
+			if (cur != 0) {
+				zs->zs_parity_consumed = MAX(
+				    zs->zs_parity_consumed, cur);
+				zs->zs_parity_label_txg = MAX(
+				    zs->zs_parity_label_txg, cur);
+			}
+		} else {
+			/* The txg "cur" may go on in the next call. */
+			if (cur != 0 && cur - 1 > zs->zs_parity_consumed)
+				zs->zs_parity_consumed = cur - 1;
+			if (prev != 0 && prev > zs->zs_parity_label_txg)
+				zs->zs_parity_label_txg = prev;
+			if (!drain && ++calls >= 4)
+				break;
+		}
+	}
+	if (stop != 0 && zs->zs_parity_label_txg > stop)
+		zs->zs_parity_label_txg = stop;
+	return (error);
+}
+
+static void
+ztest_parity_set_prop(spa_t *spa, zpool_prop_t prop, uint64_t value)
+{
+	nvlist_t *props = fnvlist_alloc();
+	int error;
+
+	fnvlist_add_uint64(props, zpool_prop_to_name(prop), value);
+	error = spa_prop_set(spa, props);
+	fnvlist_free(props);
+	/* A replace that is a healing resilver keeps parity off until done. */
+	if (error == ZFS_ERR_RESILVER_IN_PROGRESS &&
+	    ztest_opts.zo_verbose >= 2)
+		(void) printf("parity: parityset=on refused, a resilver "
+		    "is running\n");
+}
+
+/* Sometimes small limits, so that the throttle and onstall are reached. */
+static void
+ztest_parity_limits(spa_t *spa)
+{
+	ztest_shared_t *zs = ztest_shared;
+
+	if (zs->zs_parity_small != 0) {
+		if (ztest_random(4) == 0) {
+			ztest_parity_set_prop(spa,
+			    ZPOOL_PROP_PARITY_MAX_RECORDS, 0);
+			ztest_parity_set_prop(spa, ZPOOL_PROP_PARITY_MAX_HELD,
+			    0);
+			ztest_parity_set_prop(spa, ZPOOL_PROP_PARITY_ONSTALL,
+			    ZPOOL_PARITY_ONSTALL_CONTINUE);
+			zs->zs_parity_small = 0;
+		}
+	} else if (ztest_random(40) == 0) {
+		ztest_parity_set_prop(spa, ZPOOL_PROP_PARITY_MAX_RECORDS,
+		    (256ULL << 10) << ztest_random(7));
+		/* The held-space limit is a percent of the pool. */
+		ztest_parity_set_prop(spa, ZPOOL_PROP_PARITY_MAX_HELD,
+		    1 + ztest_random(5));
+		ztest_parity_set_prop(spa, ZPOOL_PROP_PARITY_ONSTALL,
+		    ztest_random(2) == 0 ? ZPOOL_PARITY_ONSTALL_CONTINUE :
+		    ZPOOL_PARITY_ONSTALL_WAIT);
+		zs->zs_parity_small = 1;
+	}
+}
+
+/* APPLIED with a random txg that the shadow holds, and sometimes DROP. */
+static void
+ztest_parity_apply(spa_t *spa, const ztest_parity_info_t *zi)
+{
+	ztest_shared_t *zs = ztest_shared;
+	spa_lag_t *lag = spa_parity_lag(spa);
+	uint64_t consumed = zs->zs_parity_consumed;
+	uint64_t set_guid = ztest_parity_set_guid(spa, zi);
+	uint64_t txg;
+	int error, how;
+
+	if (lag == NULL)
+		return;
+
+	if (ztest_random(25) == 0) {
+		/* DROP: the records and the shadow are gone. */
+		how = ztest_random(2);
+		if (zi->zpi_set_guid == 0) {
+			error = spa_parity_ioc_applied(spa, set_guid,
+			    zi->zpi_generation, 0);
+			if (error != 0) {
+				ASSERT(error == ESTALE || error == ENOTSUP ||
+				    error == EROFS || error == EINTR ||
+				    error == ESHUTDOWN);
+				return;
+			}
+		}
+		if (zi->zpi_set_guid != 0) {
+			error = spa_parity_ioc_drop(spa, set_guid + 1,
+			    zi->zpi_generation);
+			ASSERT3S(error, ==, ZFS_ERR_PARITY_SET_MISMATCH);
+		}
+		zs->zs_parity_valid = 0;
+		error = how == 0 ? spa_parity_ioc_drop(spa, set_guid,
+		    zi->zpi_generation) : spa_lag_drop(spa);
+		ASSERT(error == 0 || error == ESTALE || error == ENOTSUP ||
+		    error == EINTR || error == ESHUTDOWN || error == EROFS);
+		zs->zs_parity_drops++;
+		return;
+	}
+
+	switch (ztest_random(8)) {
+	case 0:
+		return;
+	case 1:
+	case 2:
+		/* Any txg up to the consumed one: most are old ones. */
+		txg = ztest_random(consumed + 1);
+		break;
+	case 3:
+		txg = consumed - MIN(consumed, ztest_random(8));
+		break;
+	default:
+		txg = consumed;
+		break;
+	}
+	if (txg < zi->zpi_applied_txg)
+		zs->zs_parity_stale++;
+	if (zi->zpi_set_guid != 0 && ztest_random(25) == 0) {
+		error = spa_parity_ioc_applied(spa, set_guid + 1,
+		    zi->zpi_generation, txg);
+		ASSERT3S(error, ==, ZFS_ERR_PARITY_SET_MISMATCH);
+	}
+
+	how = ztest_random(3);
+	if (how == 0) {
+		error = spa_parity_ioc_applied(spa, set_guid,
+		    zi->zpi_generation, txg);
+	} else if (how == 1) {
+		error = spa_lag_applied(lag, txg, 0);
+	} else {
+		error = spa_lag_applied(lag, txg, SPA_LAG_FORCE);
+		zs->zs_parity_forced++;
+	}
+	if (error != 0 && error != ESTALE && error != ENOTSUP &&
+	    error != EROFS && error != EINTR && error != ESHUTDOWN) {
+		fatal(B_FALSE, "parity APPLIED(%llu) returned %d",
+		    (u_longlong_t)txg, error);
+	}
+	if (error == 0) {
+		zs->zs_parity_applied = MAX(zs->zs_parity_applied, txg);
+		zs->zs_parity_applies++;
+	}
+}
+
+/*
+ * One round of the consumer.  With "drain" it only brings the shadow up to
+ * date (the end of a pass); else it also applies and drops.  The toggles and
+ * the limits are in ztest_parity_round(): they must not depend on a shadow
+ * (with them in here, a shadow that never started hid them too).
+ */
+static void
+ztest_parity_round_impl(spa_t *spa, boolean_t drain, char *zpath)
+{
+	ztest_shared_t *zs = ztest_shared;
+	ztest_parity_info_t zi;
+	int error;
+
+	zi.zpi_path = zpath;
+	if (ztest_parity_get_info(spa, &zi) != 0)
+		return;
+	if (zi.zpi_throttled)
+		zs->zs_parity_throttled++;
+	if (zi.zpi_unprotected)
+		zs->zs_parity_unprot++;
+
+	if (zi.zpi_dropping)
+		return;
+	if (!zi.zpi_member) {
+		/* No records, and nothing is captured: no shadow either. */
+		if (zs->zs_parity_valid != 0)
+			ztest_parity_invalidate();
+		return;
+	}
+
+	if (zs->zs_parity_valid != 0 &&
+	    (zi.zpi_generation != zs->zs_parity_gen ||
+	    zi.zpi_start_txg != zs->zs_parity_start)) {
+		/* A new epoch that we did not ask for: a stall drop. */
+		zs->zs_parity_epochs++;
+		ztest_parity_invalidate();
+	}
+	if (zs->zs_parity_valid == 0) {
+		error = ztest_parity_start_shadow(spa, &zi);
+		if (error != 0)
+			zs->zs_parity_init_skips++;
+		if (error == EINVAL) {
+			/* The records were released: start again. */
+			if (spa_parity_ioc_drop(spa,
+			    ztest_parity_set_guid(spa, &zi),
+			    zi.zpi_generation) == 0)
+				zs->zs_parity_drops++;
+		} else if (error != 0 && error != EAGAIN &&
+		    ztest_parity_same_epoch(spa)) {
+			/*
+			 * EAGAIN: start_txg - 1 is not synced yet.  ENOTSUP
+			 * or ESTALE: the epoch ended under the MAP.  Any
+			 * other error in a stable epoch is a defect: before
+			 * A MAP that never said DONE (EIO here) was
+			 * swallowed, and no shadow ever started.
+			 */
+			fatal(B_FALSE, "parity: the shadow of epoch %llu "
+			    "(start txg %llu) did not start: error %d",
+			    (u_longlong_t)zi.zpi_generation,
+			    (u_longlong_t)zi.zpi_start_txg, error);
+		}
+		if (error != 0)
+			return;
+	}
+	if (ztest_parity_open(&zi) != 0) {
+		ztest_parity_invalidate();
+		return;
+	}
+
+	error = ztest_parity_consume(spa, drain, zi.zpi_stop_txg);
+	if (error != 0) {
+		/* The records went away under us: look again next round. */
+		if (!ztest_parity_same_epoch(spa))
+			ztest_parity_invalidate();
+		else if (error != ESTALE && error != ENOENT)
+			fatal(B_FALSE, "parity: RECORDS/READ error %d in a "
+			    "stable epoch", error);
+		return;
+	}
+	if (drain)
+		return;
+
+	/* APPLIED and DROP. */
+	if (zs->zs_parity_valid != 0)
+		ztest_parity_apply(spa, &zi);
+}
+
+/*
+ * Is the property parityset on?  The pool says, not zs_parity_off: a pass
+ * can be killed between the change of the property and the change of
+ * zs_parity_off, and then the flag lies until the end of the run.
+ */
+static boolean_t
+ztest_parity_prop_on(spa_t *spa)
+{
+	spa_parity_t *ps = spa->spa_parity;
+
+	return (ps != NULL && ps->ps_prop_on);
+}
+
+/* Sometimes turn parityset off, and on again later. */
+static void
+ztest_parity_toggle(spa_t *spa)
+{
+	ztest_shared_t *zs = ztest_shared;
+
+	zs->zs_parity_off = !ztest_parity_prop_on(spa);
+	if (zs->zs_parity_off != 0) {
+		if (ztest_random(3) == 0) {
+			ztest_parity_set_prop(spa, ZPOOL_PROP_PARITYSET, 1);
+			zs->zs_parity_off = 0;
+			zs->zs_parity_toggles++;
+		}
+	} else if (ztest_random(30) == 0) {
+		ztest_parity_set_prop(spa, ZPOOL_PROP_PARITYSET, 0);
+		zs->zs_parity_off = 1;
+		zs->zs_parity_toggles++;
+	}
+}
+
+static void
+ztest_parity_round(spa_t *spa, boolean_t drain)
+{
+	ztest_parity_info_t zi;
+
+	zi.zpi_path = kmem_alloc(MAXPATHLEN, KM_SLEEP);
+	ztest_parity_round_impl(spa, drain, zi.zpi_path);
+	kmem_free(zi.zpi_path, MAXPATHLEN);
+	if (!drain) {
+		/* Throttle and toggles, with or without a shadow. */
+		ztest_parity_limits(spa);
+		ztest_parity_toggle(spa);
+	}
+}
+
+/*
+ * Parity set mode: the rebuild check runs only at the end of a pass that is
+ * not killed.  Most passes are killed, so a run could end without one check.
+ * Until a check has passed, the passes of the last two pass times
+ * are not killed.
+ */
+static boolean_t
+ztest_parity_keep_pass(const ztest_shared_t *zs)
+{
+	return (ztest_opts.zo_parity && zs->zs_parity_rb_pass == 0 &&
+	    zs->zs_proc_stop - zs->zs_thread_start <=
+	    (hrtime_t)(2 * ztest_opts.zo_passtime) * NANOSEC);
+}
+
+/*
+ * The gate of a -Z run: a run of 120 s or more must have used the
+ * consumer for what it is for.  A shadow, APPLIED and a rebuild check that
+ * passed; from 240 s also a toggle or a DROP of ours.  A pass whose rebuild
+ * check is skipped (a replace under way, or an epoch that ended at the end
+ * of the pass) is not an error, but one pass must get through.  A run
+ * with fewer than three completed passes (the others were killed) may skip
+ * them all by chance (one run had 2 passes and 2 skips): it warns
+ * instead, and the other runs of the wave still need a passed check.
+ */
+static void
+ztest_parity_gate(const ztest_shared_t *zs)
+{
+	const char *miss = NULL;
+
+	if (!ztest_opts.zo_parity || ztest_opts.zo_time < 120)
+		return;
+	if (zs->zs_parity_inits == 0)
+		miss = "no shadow started";
+	else if (zs->zs_parity_applies == 0)
+		miss = "no APPLIED call succeeded";
+	else if (zs->zs_parity_rb_pass == 0 && zs->zs_parity_finals >= 3)
+		miss = "no rebuild check passed";
+	else if (zs->zs_parity_rb_pass == 0)
+		(void) printf("parity gate: warning: no rebuild check passed "
+		    "(%llu skipped in %llu completed passes)\n",
+		    (u_longlong_t)zs->zs_parity_rb_skip,
+		    (u_longlong_t)zs->zs_parity_finals);
+	else if (ztest_opts.zo_time >= 240 &&
+	    zs->zs_parity_toggles + zs->zs_parity_drops == 0)
+		miss = "no parityset toggle and no DROP of ours";
+	if (miss != NULL) {
+		fatal(B_FALSE, "parity gate: %s in a run of %llu s: %llu "
+		    "shadows (%llu refused), %llu APPLIED, rebuild checks "
+		    "%llu passed %llu skipped in %llu completed passes, "
+		    "%llu toggles, %llu drops of ours", miss,
+		    (u_longlong_t)ztest_opts.zo_time,
+		    (u_longlong_t)zs->zs_parity_inits,
+		    (u_longlong_t)zs->zs_parity_init_skips,
+		    (u_longlong_t)zs->zs_parity_applies,
+		    (u_longlong_t)zs->zs_parity_rb_pass,
+		    (u_longlong_t)zs->zs_parity_rb_skip,
+		    (u_longlong_t)zs->zs_parity_finals,
+		    (u_longlong_t)zs->zs_parity_toggles,
+		    (u_longlong_t)zs->zs_parity_drops);
+	}
+	if (ztest_opts.zo_verbose >= 1) {
+		(void) printf("parity gate passed: %llu shadows, %llu APPLIED, "
+		    "%llu rebuild checks, %llu toggles, %llu drops of ours\n",
+		    (u_longlong_t)zs->zs_parity_inits,
+		    (u_longlong_t)zs->zs_parity_applies,
+		    (u_longlong_t)zs->zs_parity_rb_pass,
+		    (u_longlong_t)zs->zs_parity_toggles,
+		    (u_longlong_t)zs->zs_parity_drops);
+	}
+}
+
+static __attribute__((noreturn)) void
+ztest_parity_thread(void *arg)
+{
+	spa_t *spa = arg;
+
+	while (!ztest_exiting) {
+		ztest_parity_round(spa, B_FALSE);
+		(void) poll(NULL, 0, 50 + ztest_random(950));
+	}
+	thread_exit();
+}
+
+/*
+ * The read-only checks of one imported pool.  The calls may refuse (no
+ * records, nothing to read) but must not fail in any other way.
+ */
+static void
+ztest_parity_ro_call(const char *what, int error)
+{
+	if (error != 0 && error != ENOTSUP && error != EROFS &&
+	    error != EINVAL && error != ENOENT && error != ESTALE)
+		fatal(B_FALSE, "parity %s on a read-only pool: error %d",
+		    what, error);
+}
+
+/*
+ * Check packed READV output for overlapping entries and for one bad entry.
+ */
+static void
+ztest_parity_readv_check(spa_t *spa, const uint64_t *entry,
+    const uint64_t *index, const uint8_t *expected, uint_t len)
+{
+	uint64_t entries[2 * PARITY_ENTRY_WORDS];
+	uint64_t indexes[2] = { *index, *index };
+	uint64_t *offsets, *lengths;
+	int32_t *errors;
+	boolean_t *verified;
+	uint8_t *data;
+	uint_t nerrors, nverified, noffsets, nlengths, data_len;
+	nvlist_t *out;
+	blkptr_t *bad_bp;
+	int error;
+
+	memcpy(entries, entry, PARITY_ENTRY_WORDS * sizeof (*entry));
+	memcpy(&entries[PARITY_ENTRY_WORDS], entry,
+	    PARITY_ENTRY_WORDS * sizeof (*entry));
+	out = fnvlist_alloc();
+	error = spa_parity_ioc_readv(spa, entries,
+	    2 * PARITY_ENTRY_WORDS, indexes, ARRAY_SIZE(indexes), out);
+	if (error != 0)
+		fatal(B_FALSE, "parity: overlapping READV failed with %d",
+		    error);
+	errors = fnvlist_lookup_int32_array(out, ZPARITY_READ_ERRORS,
+	    &nerrors);
+	verified = fnvlist_lookup_boolean_array(out, ZPARITY_VERIFIED,
+	    &nverified);
+	offsets = fnvlist_lookup_uint64_array(out, ZPARITY_DATA_OFFSETS,
+	    &noffsets);
+	lengths = fnvlist_lookup_uint64_array(out, ZPARITY_DATA_LENGTHS,
+	    &nlengths);
+	data = fnvlist_lookup_uint8_array(out, ZPARITY_DATA, &data_len);
+	if (nerrors != 2 || errors[0] != 0 || errors[1] != 0 ||
+	    nverified != 2 || !verified[0] || !verified[1] ||
+	    noffsets != 2 || offsets[0] != 0 || offsets[1] != len ||
+	    nlengths != 2 || lengths[0] != len || lengths[1] != len ||
+	    data_len != 2 * len || memcmp(data, expected, len) != 0 ||
+	    memcmp(data + len, expected, len) != 0)
+		fatal(B_FALSE, "parity: overlapping READV output is invalid");
+	fnvlist_free(out);
+
+	memcpy(entries, entry, PARITY_ENTRY_WORDS * sizeof (*entry));
+	memcpy(&entries[PARITY_ENTRY_WORDS], entry,
+	    PARITY_ENTRY_WORDS * sizeof (*entry));
+	bad_bp = (blkptr_t *)&entries[PARITY_ENTRY_WORDS + PARITY_EW_BP];
+	memset(&bad_bp->blk_cksum, 0, sizeof (bad_bp->blk_cksum));
+	out = fnvlist_alloc();
+	error = spa_parity_ioc_readv(spa, entries,
+	    2 * PARITY_ENTRY_WORDS, indexes, ARRAY_SIZE(indexes), out);
+	if (error != 0)
+		fatal(B_FALSE, "parity: partial READV failed with %d", error);
+	errors = fnvlist_lookup_int32_array(out, ZPARITY_READ_ERRORS,
+	    &nerrors);
+	verified = fnvlist_lookup_boolean_array(out, ZPARITY_VERIFIED,
+	    &nverified);
+	offsets = fnvlist_lookup_uint64_array(out, ZPARITY_DATA_OFFSETS,
+	    &noffsets);
+	lengths = fnvlist_lookup_uint64_array(out, ZPARITY_DATA_LENGTHS,
+	    &nlengths);
+	data = fnvlist_lookup_uint8_array(out, ZPARITY_DATA, &data_len);
+	if (nerrors != 2 || errors[0] != 0 || errors[1] != ECKSUM ||
+	    nverified != 2 || !verified[0] || verified[1] ||
+	    noffsets != 2 || offsets[0] != 0 || offsets[1] != 0 ||
+	    nlengths != 2 || lengths[0] != len || lengths[1] != 0 ||
+	    data_len != len || memcmp(data, expected, len) != 0)
+		fatal(B_FALSE, "parity: partial READV output is invalid");
+	fnvlist_free(out);
+}
+
+static void
+ztest_parity_current_check(spa_t *spa, const uint64_t *entry)
+{
+	const blkptr_t *bp = (const blkptr_t *)&entry[PARITY_EW_BP];
+	uint64_t kind = entry[PARITY_EW_KIND];
+	uint64_t dva = (kind >> 16) & 0xffff;
+	uint64_t offset = DVA_GET_OFFSET(&bp->blk_dva[dva]);
+	uint64_t txg;
+	uint64_t *current;
+	uint_t nwords;
+	boolean_t found;
+	nvlist_t *out = fnvlist_alloc();
+	int error;
+
+	error = spa_parity_ioc_current(spa, SPA_PARITY_VDEV_FIRST, offset, out);
+	if (error != 0)
+		fatal(B_FALSE, "parity: CURRENT at %llu failed with %d",
+		    (u_longlong_t)offset, error);
+	found = fnvlist_lookup_boolean_value(out, ZPARITY_FOUND);
+	current = fnvlist_lookup_uint64_array(out, ZPARITY_ENTRY, &nwords);
+	if (!found) {
+		if (nwords != 0)
+			fatal(B_FALSE,
+			    "parity: CURRENT returned an entry when absent");
+	} else {
+		const blkptr_t *current_bp;
+		uint64_t current_kind, current_dva;
+
+		if (nwords != PARITY_ENTRY_WORDS)
+			fatal(B_FALSE, "parity: CURRENT returned %u words",
+			    nwords);
+		current_kind = current[PARITY_EW_KIND];
+		current_dva = (current_kind >> 16) & 0xffff;
+		current_bp = (const blkptr_t *)&current[PARITY_EW_BP];
+		txg = fnvlist_lookup_uint64(out, ZPARITY_TXG);
+		if ((current_kind & 0xff) != PARITY_KIND_ALLOC ||
+		    current_dva >= SPA_DVAS_PER_BP ||
+		    DVA_GET_ASIZE(&current_bp->blk_dva[current_dva]) == 0 ||
+		    DVA_GET_OFFSET(&current_bp->blk_dva[current_dva]) !=
+		    offset ||
+		    current[PARITY_EW_TXG] != txg)
+			fatal(B_FALSE,
+			    "parity: CURRENT returned an invalid entry");
+	}
+	fnvlist_free(out);
+}
+
+static int
+ztest_parity_ro_calls(spa_t *spa)
+{
+	nvlist_t *out;
+	uint64_t last = spa_last_synced_txg(spa);
+	uint64_t applied = 0, first = 0;
+	uint64_t cursor = 0;
+	boolean_t done = B_FALSE;
+	boolean_t spoof_checked = B_FALSE;
+	boolean_t readv_checked = B_FALSE;
+	boolean_t current_checked = B_FALSE;
+	int error, ok = 0;
+
+	out = fnvlist_alloc();
+	error = spa_parity_ioc_info(spa, B_FALSE, 0, out);
+	ztest_parity_ro_call("INFO", error);
+	if (error == 0) {
+		applied = fnvlist_lookup_uint64(out, ZPARITY_APPLIED_TXG);
+		first = fnvlist_lookup_uint64(out, ZPARITY_FIRST_TXG);
+		ok++;
+	}
+	fnvlist_free(out);
+
+	if (error == 0 && applied <= last && applied + 1 >= first) {
+		uint64_t block_cursor = 0;
+		boolean_t blocks_done = B_FALSE;
+		boolean_t blocks_seen = B_FALSE;
+		uint64_t previous_offset = 0;
+		uint64_t pages = 0;
+
+		while (!blocks_done && pages++ < 65536) {
+			uint64_t next;
+			uint64_t *entries;
+			uint_t nwords = 0;
+
+			out = fnvlist_alloc();
+			error = spa_parity_ioc_blocks(spa,
+			    SPA_PARITY_VDEV_FIRST, applied, block_cursor,
+			    ZTEST_PARITY_ENTRIES, out);
+			if (error != 0)
+				fatal(B_FALSE,
+				    "parity: BLOCKS at txg %llu failed with %d",
+				    (u_longlong_t)applied, error);
+			entries = fnvlist_lookup_uint64_array(out,
+			    ZPARITY_ENTRIES, &nwords);
+			if (nwords % PARITY_ENTRY_WORDS != 0)
+				fatal(B_FALSE,
+				    "parity: BLOCKS returned %u words",
+				    nwords);
+			blocks_seen |= (nwords != 0);
+			next = fnvlist_lookup_uint64(out, ZPARITY_NEXT_OFFSET);
+			blocks_done = fnvlist_lookup_boolean_value(out,
+			    ZPARITY_DONE);
+			for (uint_t i = 0; i < nwords / PARITY_ENTRY_WORDS;
+			    i++) {
+				const uint64_t *w =
+				    &entries[i * PARITY_ENTRY_WORDS];
+				const blkptr_t *bp =
+				    (const blkptr_t *)&w[PARITY_EW_BP];
+				uint64_t kind = w[PARITY_EW_KIND];
+				uint64_t dva = (kind >> 16) & 0xffff;
+				uint64_t offset;
+
+				if (dva >= SPA_DVAS_PER_BP ||
+				    DVA_GET_ASIZE(&bp->blk_dva[dva]) == 0)
+					fatal(B_FALSE,
+					    "parity: BLOCKS invalid DVA index");
+				offset = DVA_GET_OFFSET(&bp->blk_dva[dva]);
+
+				if ((kind & 0xff) != PARITY_KIND_ALLOC ||
+				    w[PARITY_EW_TXG] != applied ||
+				    BP_GET_BIRTH(bp) > applied ||
+				    offset < block_cursor ||
+				    (i != 0 && offset <= previous_offset))
+					fatal(B_FALSE,
+					    "bad BLOCKS entry at txg %llu",
+					    (u_longlong_t)applied);
+				previous_offset = offset;
+			}
+			if (!blocks_done && next <= block_cursor)
+				fatal(B_FALSE,
+				    "parity: BLOCKS page did not advance");
+			block_cursor = next;
+			fnvlist_free(out);
+		}
+		if (!blocks_done)
+			fatal(B_FALSE, "parity: BLOCKS did not finish paging");
+		if (!blocks_seen)
+			fatal(B_FALSE,
+			    "parity: BLOCKS returned no allocated blocks");
+		ok++;
+	}
+
+	while (!done) {
+		uint64_t next;
+		uint64_t *ents, *idx;
+		uint_t nw = 0, ni = 0;
+
+		out = fnvlist_alloc();
+		error = spa_parity_ioc_records(spa, 0, cursor,
+		    ZTEST_PARITY_ENTRIES, out);
+		ztest_parity_ro_call("RECORDS", error);
+		if (error != 0) {
+			fnvlist_free(out);
+			break;
+		}
+
+		ents = fnvlist_lookup_uint64_array(out, ZPARITY_ENTRIES, &nw);
+		idx = fnvlist_lookup_uint64_array(out, ZPARITY_INDEXES, &ni);
+		VERIFY3U(nw, ==, ni * PARITY_ENTRY_WORDS);
+		next = fnvlist_lookup_uint64(out, ZPARITY_CURSOR);
+		done = fnvlist_lookup_boolean_value(out, ZPARITY_DONE);
+		ok++;
+
+		for (uint_t i = 0; i < ni; i++) {
+			const uint64_t *w = &ents[i * PARITY_ENTRY_WORDS];
+			nvlist_t *rd;
+			const blkptr_t *bp =
+			    (const blkptr_t *)&w[PARITY_EW_BP];
+			uint8_t *data;
+			uint_t len;
+			boolean_t match, verified, verify_verified;
+
+			if ((w[PARITY_EW_KIND] & 0xff) != PARITY_KIND_ALLOC ||
+			    ((w[PARITY_EW_KIND] >> 8) & 1) != 0)
+				continue;
+
+			rd = fnvlist_alloc();
+			error = spa_parity_ioc_read(spa, w, PARITY_ENTRY_WORDS,
+			    &idx[i], rd);
+			if (error != 0)
+				fatal(B_FALSE, "parity: read-only ALLOC READ "
+				    "at txg %llu failed with %d", (u_longlong_t)
+				    w[PARITY_EW_TXG], error);
+			verified = fnvlist_lookup_boolean_value(rd,
+			    ZPARITY_VERIFIED);
+			if (!verified && !ztest_parity_alloc_unverified(bp))
+				fatal(B_FALSE, "parity: read-only ALLOC READ "
+				    "at txg %llu was not verified and has "
+				    "non-zero checksum",
+				    (u_longlong_t)w[PARITY_EW_TXG]);
+			data = fnvlist_lookup_uint8_array(rd,
+			    ZPARITY_DATA, &len);
+			error = spa_parity_ioc_verify(spa, w,
+			    PARITY_ENTRY_WORDS,
+			    &idx[i], data, len, &match, &verify_verified);
+			if (ztest_parity_alloc_no_checksum(bp)) {
+				if (verified || error != EINVAL)
+					fatal(B_FALSE,
+					    "parity: no-checksum ALLOC: READ "
+					    "verified %u, VERIFY error %d",
+					    (uint_t)verified, error);
+			} else if (error != 0 || verify_verified != verified ||
+			    match != verify_verified) {
+				/*
+				 * READ and VERIFY must agree for this
+				 * indexed ALLOC.
+				 */
+				fatal(B_FALSE, "parity: ALLOC VERIFY txg %llu: "
+				    "READ verified %u, VERIFY error %d, "
+				    "verified %u, match %u",
+				    (u_longlong_t)w[PARITY_EW_TXG],
+				    (uint_t)verified, error,
+				    (uint_t)verify_verified, (uint_t)match);
+			}
+			if (verified && !spoof_checked) {
+				uint64_t spoof[PARITY_ENTRY_WORDS];
+				blkptr_t *spoof_bp =
+				    (blkptr_t *)&spoof[PARITY_EW_BP];
+				nvlist_t *bad = fnvlist_alloc();
+				boolean_t bad_match, bad_verified;
+
+				memcpy(spoof, w, sizeof (spoof));
+				memset(&spoof_bp->blk_cksum, 0,
+				    sizeof (spoof_bp->blk_cksum));
+				error = spa_parity_ioc_read(spa, spoof,
+				    PARITY_ENTRY_WORDS, &idx[i], bad);
+				fnvlist_free(bad);
+				if (error != ECKSUM)
+					fatal(B_FALSE,
+					    "parity: spoof READ failed");
+				error = spa_parity_ioc_verify(spa, spoof,
+				    PARITY_ENTRY_WORDS, &idx[i], data, len,
+				    &bad_match, &bad_verified);
+				if (error != 0 || !bad_verified || bad_match)
+					fatal(B_FALSE,
+					    "parity: spoof VERIFY failed");
+				spoof_checked = B_TRUE;
+			}
+			if (verified && !readv_checked) {
+				ztest_parity_readv_check(spa, w, &idx[i], data,
+				    len);
+				readv_checked = B_TRUE;
+			}
+			if (verified && !current_checked) {
+				ztest_parity_current_check(spa, w);
+				current_checked = B_TRUE;
+			}
+			if (!verified)
+				ztest_shared->zs_parity_unverified++;
+			fnvlist_free(rd);
+		}
+		if (!done)
+			VERIFY3U(next, !=, cursor);
+		cursor = next;
+		fnvlist_free(out);
+	}
+
+	out = fnvlist_alloc();
+	error = spa_parity_ioc_map(spa, SPA_PARITY_VDEV_FIRST, last, 0, 1024,
+	    out);
+	ztest_parity_ro_call("MAP", error);
+	ok += (error == 0);
+	fnvlist_free(out);
+
+	out = fnvlist_alloc();
+	error = spa_parity_ioc_label(spa, SPA_PARITY_VDEV_FIRST, last, out);
+	ztest_parity_ro_call("LABEL", error);
+	ok += (error == 0);
+	fnvlist_free(out);
+	return (ok);
+}
+
+/*
+ * Export the pool, import it read-only, make the read-only calls, export it
+ * again, and require that the device file is exactly as it was.
+ */
+static void
+ztest_parity_ro_check(const char *devpath, nvlist_t *config)
+{
+	ztest_shared_t *zs = ztest_shared;
+	char *name = ztest_opts.zo_pool;
+	nvlist_t *props = fnvlist_alloc();
+	nvlist_t *oldconfig = NULL;
+	struct stat before, after;
+	spa_t *spa;
+	uint64_t txg;
+	int error, ok;
+
+	if (stat(devpath, &before) != 0)
+		fatal(B_TRUE, "parity: cannot stat %s", devpath);
+	fnvlist_add_uint64(props, zpool_prop_to_name(ZPOOL_PROP_READONLY), 1);
+	error = spa_import(name, config, props, 0);
+	fnvlist_free(props);
+	if (error != 0)
+		fatal(B_FALSE, "parity: read-only import of %s failed: %d",
+		    name, error);
+
+	VERIFY0(spa_open(name, &spa, FTAG));
+	ASSERT(!spa_writeable(spa));
+	txg = spa->spa_uberblock.ub_txg;
+	ok = ztest_parity_ro_calls(spa);
+	if (spa->spa_uberblock.ub_txg != txg)
+		fatal(B_FALSE, "parity: uberblock txg moved from %llu to %llu "
+		    "on a read-only pool", (u_longlong_t)txg,
+		    (u_longlong_t)spa->spa_uberblock.ub_txg);
+	spa_close(spa, FTAG);
+	VERIFY0(spa_export(name, &oldconfig, B_FALSE, B_FALSE));
+	if (oldconfig != NULL)
+		fnvlist_free(oldconfig);
+
+	if (stat(devpath, &after) != 0)
+		fatal(B_TRUE, "parity: cannot stat %s", devpath);
+	if (before.st_size != after.st_size ||
+	    before.st_mtim.tv_sec != after.st_mtim.tv_sec ||
+	    before.st_mtim.tv_nsec != after.st_mtim.tv_nsec)
+		fatal(B_FALSE, "parity: the device file %s changed during a "
+		    "read-only import", devpath);
+	zs->zs_parity_ro_pass++;
+	if (ztest_opts.zo_verbose >= 3) {
+		(void) printf("parity: read-only re-import passed, "
+		    "%d calls answered\n", ok);
+	}
+}
+
+typedef struct ztest_parity_blkarg {
+	uint64_t	zpb_blocks;
+	uint64_t	zpb_bad;
+} ztest_parity_blkarg_t;
+
+/* Read each block of the rebuilt pool: its checksum must pass. */
+static int
+ztest_parity_blk_cb(spa_t *spa, zilog_t *zilog, const blkptr_t *bp,
+    const zbookmark_phys_t *zb, const struct dnode_phys *dnp, void *arg)
+{
+	(void) zilog, (void) dnp;
+	ztest_parity_blkarg_t *pb = arg;
+	size_t size;
+	abd_t *abd;
+	int error;
+
+	if (bp == NULL || BP_IS_HOLE(bp) || BP_IS_EMBEDDED(bp) ||
+	    BP_IS_REDACTED(bp))
+		return (0);
+	/* The log blocks are not protected, so the rebuilt disk has none. */
+	if (zb->zb_level == ZB_ZIL_LEVEL ||
+	    BP_GET_TYPE(bp) == DMU_OT_INTENT_LOG)
+		return (0);
+
+	size = BP_GET_PSIZE(bp);
+	abd = abd_alloc_linear(size, B_FALSE);
+	error = zio_wait(zio_read(NULL, spa, bp, abd, size, NULL, NULL,
+	    ZIO_PRIORITY_ASYNC_READ,
+	    ZIO_FLAG_CANFAIL | ZIO_FLAG_SCRUB | ZIO_FLAG_RAW, zb));
+	abd_free(abd);
+	pb->zpb_blocks++;
+	if (error != 0) {
+		if (pb->zpb_bad++ < 8) {
+			(void) printf("parity: rebuilt pool: block "
+			    "%llu/%llu/%llu/%llu failed with %d\n",
+			    (u_longlong_t)zb->zb_objset,
+			    (u_longlong_t)zb->zb_object,
+			    (u_longlong_t)zb->zb_level,
+			    (u_longlong_t)zb->zb_blkid, error);
+		}
+	}
+	return (0);
+}
+
+/*
+ * The shadow is in the directory that "zdb -e -p" and the import scan read.
+ * Its labels have the guids of the pool at an older txg, so zero them when
+ * the check is done.
+ */
+static void
+ztest_parity_shadow_unlabel(const char *spath)
+{
+	size_t len = 2 * sizeof (vdev_label_t);
+	void *zeros = kmem_zalloc(len, KM_SLEEP);
+	int fd = open(spath, O_RDWR);
+
+	if (fd != -1) {
+		if (pwrite(fd, zeros, len, 0) != (ssize_t)len) {
+			(void) fprintf(stderr, "ztest: cannot clear the "
+			    "labels of %s\n", spath);
+		}
+		(void) close(fd);
+	}
+	kmem_free(zeros, len);
+}
+
+/*
+ * Write the saved label into the shadow, import the
+ * shadow as a read-only pool, and check that it is the pool at the label's
+ * txg and that every block a traversal finds passes its checksum.
+ * "config" is the configuration of the exported pool.
+ */
+static void
+ztest_parity_rebuild_check(nvlist_t *config, const uint8_t *label,
+    uint64_t label_txg)
+{
+	ztest_shared_t *zs = ztest_shared;
+	char rname[ZFS_MAX_DATASET_NAME_LEN];
+	char *spath;
+	nvlist_t *rconfig, *tree, *props, *oldconfig = NULL;
+	nvlist_t **child;
+	ztest_parity_blkarg_t pb = { 0 };
+	spa_t *spa;
+	uint_t nchild = 0;
+	const char *type = NULL;
+	int error;
+
+	spath = kmem_alloc(MAXPATHLEN, KM_SLEEP);
+	ztest_parity_path(spath, MAXPATHLEN, "shadow");
+	(void) snprintf(rname, sizeof (rname), "%s_rebuilt",
+	    ztest_opts.zo_pool);
+
+	/* The label of the txg, in labels 0 and 1; labels 2 and 3 stay 0. */
+	if (ztest_parity_fd == -1) {
+		ztest_parity_fd = open(spath, O_RDWR);
+		if (ztest_parity_fd == -1)
+			fatal(B_TRUE, "parity: cannot open %s", spath);
+	}
+	if (pwrite(ztest_parity_fd, label, 2 * sizeof (vdev_label_t), 0) !=
+	    (ssize_t)(2 * sizeof (vdev_label_t)))
+		fatal(B_TRUE, "parity: cannot write the label to %s", spath);
+	ztest_parity_close();
+
+	/* The same configuration, with the shadow as the one disk. */
+	rconfig = fnvlist_dup(config);
+	tree = fnvlist_lookup_nvlist(rconfig, ZPOOL_CONFIG_VDEV_TREE);
+	if (nvlist_lookup_nvlist_array(tree, ZPOOL_CONFIG_CHILDREN, &child,
+	    &nchild) != 0 || nchild != 1 ||
+	    nvlist_lookup_string(child[0], ZPOOL_CONFIG_TYPE, &type) != 0 ||
+	    strcmp(type, VDEV_TYPE_FILE) != 0) {
+		/* A replace is under way, or a log device: not one disk. */
+		fnvlist_free(rconfig);
+		ztest_parity_shadow_unlabel(spath);
+		kmem_free(spath, MAXPATHLEN);
+		zs->zs_parity_rb_skip++;
+		return;
+	}
+	fnvlist_add_string(child[0], ZPOOL_CONFIG_PATH, spath);
+
+	props = fnvlist_alloc();
+	fnvlist_add_uint64(props, zpool_prop_to_name(ZPOOL_PROP_READONLY), 1);
+	error = spa_import(rname, rconfig, props, 0);
+	fnvlist_free(props);
+	fnvlist_free(rconfig);
+	if (error != 0)
+		fatal(B_FALSE, "parity: the rebuilt pool at txg %llu did not "
+		    "import: error %d", (u_longlong_t)label_txg, error);
+
+	VERIFY0(spa_open(rname, &spa, FTAG));
+	if (spa->spa_uberblock.ub_txg != label_txg)
+		fatal(B_FALSE, "parity: the rebuilt pool imported at txg %llu, "
+		    "not at the applied txg %llu",
+		    (u_longlong_t)spa->spa_uberblock.ub_txg,
+		    (u_longlong_t)label_txg);
+
+	error = traverse_pool(spa, 0,
+	    TRAVERSE_PRE | TRAVERSE_PREFETCH_METADATA | TRAVERSE_NO_DECRYPT,
+	    ztest_parity_blk_cb, &pb);
+	if (error != 0 || pb.zpb_bad != 0)
+		fatal(B_FALSE, "parity: the rebuilt pool at txg %llu has %llu "
+		    "bad blocks of %llu (traversal error %d)",
+		    (u_longlong_t)label_txg, (u_longlong_t)pb.zpb_bad,
+		    (u_longlong_t)pb.zpb_blocks, error);
+	spa_close(spa, FTAG);
+	VERIFY0(spa_export(rname, &oldconfig, B_FALSE, B_FALSE));
+	if (oldconfig != NULL)
+		fnvlist_free(oldconfig);
+
+	ztest_parity_shadow_unlabel(spath);
+	kmem_free(spath, MAXPATHLEN);
+	zs->zs_parity_rb_pass++;
+	zs->zs_parity_rb_blocks += pb.zpb_blocks;
+	if (ztest_opts.zo_verbose >= 3) {
+		(void) printf("parity: rebuild check passed at txg %llu, "
+		    "%llu blocks\n", (u_longlong_t)label_txg,
+		    (u_longlong_t)pb.zpb_blocks);
+	}
+}
+
+/*
+ * The end of a pass, after the workers and the consumer have stopped: bring
+ * the shadow up to date, take the label, then the read-only re-import and the
+ * rebuild check.  The pool is imported again at the end.
+ */
+static void
+ztest_parity_final(void)
+{
+	ztest_shared_t *zs = ztest_shared;
+	ztest_parity_info_t zi;
+	nvlist_t *config = NULL, *out;
+	uint8_t *label = NULL;
+	uint64_t label_txg, released = 0, drops = 0;
+	spa_t *spa;
+	char *devpath = kmem_alloc(MAXPATHLEN, KM_SLEEP);
+	boolean_t rebuild = B_FALSE;
+	int error;
+
+	devpath[0] = '\0';
+	zi.zpi_path = kmem_alloc(MAXPATHLEN, KM_SLEEP);
+	VERIFY0(spa_open(ztest_opts.zo_pool, &spa, FTAG));
+
+	/*
+	 * No small limits while we drain, and the property on again.  Both
+	 * are set whatever the flags say: a killed pass can leave a flag that
+	 * does not match the pool.  A drain is left alone: turning the
+	 * property on would drop its records, and the shadow is checked at
+	 * its stop txg (ztest_parity_consume()).
+	 */
+	ztest_parity_set_prop(spa, ZPOOL_PROP_PARITY_MAX_RECORDS, 0);
+	ztest_parity_set_prop(spa, ZPOOL_PROP_PARITY_MAX_HELD, 0);
+	ztest_parity_set_prop(spa, ZPOOL_PROP_PARITY_ONSTALL,
+	    ZPOOL_PARITY_ONSTALL_CONTINUE);
+	zs->zs_parity_small = 0;
+	zs->zs_parity_off = !ztest_parity_prop_on(spa);
+	if (zs->zs_parity_off != 0 && (ztest_parity_get_info(spa, &zi) != 0 ||
+	    !zi.zpi_draining)) {
+		ztest_parity_set_prop(spa, ZPOOL_PROP_PARITYSET, 1);
+		zs->zs_parity_off = 0;
+		zs->zs_parity_toggles++;
+	}
+	txg_wait_synced(spa_get_dsl(spa), 0);
+
+	/* Up to date: a round that only consumes (all records, no APPLIED). */
+	ztest_parity_round(spa, B_TRUE);
+	ztest_parity_check_format(spa);
+	label_txg = zs->zs_parity_label_txg;
+	if (spa->spa_parity != NULL) {
+		released = spa->spa_parity->ps_stat_released;
+		drops = spa->spa_parity->ps_stat_drops;
+	}
+
+	if (ztest_parity_get_info(spa, &zi) == 0 && zi.zpi_member &&
+	    zs->zs_parity_valid != 0 && label_txg != 0 &&
+	    zi.zpi_path[0] != '\0') {
+		out = fnvlist_alloc();
+		error = spa_parity_ioc_label(spa, SPA_PARITY_VDEV_FIRST,
+		    label_txg, out);
+		if (error == 0) {
+			uint8_t *lb;
+			uint_t n = 0;
+
+			lb = fnvlist_lookup_uint8_array(out, ZPARITY_LABEL,
+			    &n);
+			VERIFY3U(n, ==, 2 * sizeof (vdev_label_t));
+			VERIFY3U(fnvlist_lookup_uint64(out, ZPARITY_UB_TXG),
+			    ==, label_txg);
+			label = kmem_alloc(n, KM_SLEEP);
+			memcpy(label, lb, n);
+			(void) strlcpy(devpath, zi.zpi_path, MAXPATHLEN);
+			rebuild = B_TRUE;
+		} else if (ztest_opts.zo_verbose >= 3) {
+			(void) printf("parity: no label for txg %llu: "
+			    "error %d\n", (u_longlong_t)label_txg, error);
+		}
+		fnvlist_free(out);
+	}
+	spa_close(spa, FTAG);
+
+	if (!rebuild) {
+		/* Nothing to check this pass (no records, or a new epoch). */
+		zs->zs_parity_rb_skip++;
+	} else {
+		VERIFY0(spa_export(ztest_opts.zo_pool, &config, B_FALSE,
+		    B_FALSE));
+		ztest_parity_ro_check(devpath, config);
+		ztest_parity_rebuild_check(config, label, label_txg);
+		VERIFY0(spa_import(ztest_opts.zo_pool, config, NULL, 0));
+		fnvlist_free(config);
+		kmem_free(label, 2 * sizeof (vdev_label_t));
+	}
+	ztest_parity_close();
+	kmem_free(devpath, MAXPATHLEN);
+	zs->zs_parity_finals++;
+
+	if (ztest_opts.zo_verbose >= 1) {
+		(void) printf("parity consumer: applied txg %llu, %llu APPLIED "
+		    "(%llu forced, %llu old), %llu released, %llu drops "
+		    "(%llu ours), %llu epochs, %llu toggles, %llu throttled "
+		    "rounds, %llu unprotected rounds, %llu entries read "
+		    "(%llu abandoned, %llu unverified ALLOC), "
+		    "%llu shadows (%llu refused), "
+		    "rebuild checks %llu passed (%llu blocks) %llu skipped, "
+		    "read-only checks %llu passed, held now %llu bytes\n",
+		    (u_longlong_t)zs->zs_parity_applied,
+		    (u_longlong_t)zs->zs_parity_applies,
+		    (u_longlong_t)zs->zs_parity_forced,
+		    (u_longlong_t)zs->zs_parity_stale,
+		    (u_longlong_t)released, (u_longlong_t)drops,
+		    (u_longlong_t)zs->zs_parity_drops,
+		    (u_longlong_t)zs->zs_parity_epochs,
+		    (u_longlong_t)zs->zs_parity_toggles,
+		    (u_longlong_t)zs->zs_parity_throttled,
+		    (u_longlong_t)zs->zs_parity_unprot,
+		    (u_longlong_t)zs->zs_parity_reads,
+		    (u_longlong_t)zs->zs_parity_read_skips,
+		    (u_longlong_t)zs->zs_parity_unverified,
+		    (u_longlong_t)zs->zs_parity_inits,
+		    (u_longlong_t)zs->zs_parity_init_skips,
+		    (u_longlong_t)zs->zs_parity_rb_pass,
+		    (u_longlong_t)zs->zs_parity_rb_blocks,
+		    (u_longlong_t)zs->zs_parity_rb_skip,
+		    (u_longlong_t)zs->zs_parity_ro_pass,
+		    (u_longlong_t)zi.zpi_held_bytes);
+		(void) printf("parity dedup + copies cases: %llu run, %llu "
+		    "with DVAs of different births\n",
+		    (u_longlong_t)zs->zs_parity_dd_runs,
+		    (u_longlong_t)zs->zs_parity_dd_wide);
+	}
+	kmem_free(zi.zpi_path, MAXPATHLEN);
 }
 
 static void
@@ -8944,6 +10785,7 @@ ztest_run(ztest_shared_t *zs)
 	spa_t *spa;
 	objset_t *os;
 	kthread_t *resume_thread, *deadman_thread;
+	kthread_t *parity_thread = NULL;
 	uint64_t object;
 	int error;
 	int t, d;
@@ -8962,7 +10804,8 @@ ztest_run(ztest_shared_t *zs)
 	    zs->zs_thread_start + ztest_opts.zo_passtime * NANOSEC;
 	zs->zs_thread_stop = MIN(zs->zs_thread_stop, zs->zs_proc_stop);
 	zs->zs_thread_kill = zs->zs_thread_stop;
-	if (ztest_random(100) < ztest_opts.zo_killrate) {
+	if (ztest_random(100) < ztest_opts.zo_killrate &&
+	    !ztest_parity_keep_pass(zs)) {
 		zs->zs_thread_kill -=
 		    ztest_random(ztest_opts.zo_passtime * NANOSEC);
 	}
@@ -9021,6 +10864,16 @@ ztest_run(ztest_shared_t *zs)
 	    zs, 0, NULL, TS_RUN | TS_JOINABLE, defclsyspri);
 
 	spa->spa_deadman_failmode = ZIO_FAILURE_MODE_PANIC;
+
+	/*
+	 * Parity set mode: the consumer thread plays the parity daemon.  It
+	 * is a thread of its own because a writer that waits in the throttle
+	 * must not be the one that has to call APPLIED.
+	 */
+	if (ztest_opts.zo_parity) {
+		parity_thread = _thread_create(NULL, 0, ztest_parity_thread,
+		    spa, 0, NULL, TS_RUN | TS_JOINABLE, defclsyspri);
+	}
 
 	/*
 	 * Verify that we can safely inquire about any object,
@@ -9110,6 +10963,8 @@ ztest_run(ztest_shared_t *zs)
 	ztest_exiting = B_TRUE;
 	VERIFY0(thread_join(resume_thread));
 	VERIFY0(thread_join(deadman_thread));
+	if (parity_thread != NULL)
+		VERIFY0(thread_join(parity_thread));
 	ztest_resume(spa);
 
 	/*
@@ -9125,6 +10980,30 @@ ztest_run(ztest_shared_t *zs)
 	if (zc_cb_counter >= ZTEST_COMMIT_CB_MIN_REG)
 		VERIFY0(zc_min_txg_delay);
 
+	/* Parity set mode: the cost of the records, for the run's log. */
+	if (ztest_opts.zo_parity && ztest_opts.zo_verbose >= 1 &&
+	    spa->spa_parity != NULL) {
+		spa_parity_t *ps = spa->spa_parity;
+
+		(void) printf("parity: %llu record txgs, %.2f sync passes "
+		    "each (max %llu), %llu entries, %llu void, %llu late, "
+		    "%llu fix-ups, %llu lost at load, %llu records released, "
+		    "%llu left\n",
+		    (u_longlong_t)ps->ps_stat_txgs,
+		    ps->ps_stat_txgs == 0 ? 0.0 :
+		    (double)ps->ps_stat_passes / ps->ps_stat_txgs,
+		    (u_longlong_t)ps->ps_stat_max_passes,
+		    (u_longlong_t)ps->ps_stat_entries,
+		    (u_longlong_t)ps->ps_stat_voids,
+		    (u_longlong_t)ps->ps_stat_late,
+		    (u_longlong_t)ps->ps_stat_fixups,
+		    (u_longlong_t)ps->ps_stat_lost,
+		    (u_longlong_t)ps->ps_stat_released,
+		    (u_longlong_t)spa_lag_nrecs(ps->ps_lag));
+		/* With -G: the debug messages, for example the rebuilds. */
+		dump_debug_buffer();
+	}
+
 	spa_close(spa, FTAG);
 
 	/*
@@ -9135,6 +11014,13 @@ ztest_run(ztest_shared_t *zs)
 		if (ztest_opts.zo_verbose > 3)
 			(void) printf("spa_next: found %s\n", spa_name(spa));
 	spa_namespace_exit(FTAG);
+
+	/*
+	 * Parity set mode: the end of the pass is the rebuild check.  The
+	 * workers and the consumer have stopped.
+	 */
+	if (ztest_opts.zo_parity)
+		ztest_parity_final();
 
 	/*
 	 * Verify that we can export the pool and reimport it under a
@@ -9233,6 +11119,16 @@ ztest_init(ztest_shared_t *zs)
 	nvroot = make_vdev_root(NULL, NULL, NULL, ztest_opts.zo_vdev_size, 0,
 	    NULL, ztest_opts.zo_raid_children, zs->zs_mirrors, 1);
 	props = make_random_pool_props();
+
+	/* Parity set mode: the pool starts with parityset=on. */
+	if (ztest_opts.zo_parity) {
+		fnvlist_add_uint64(props,
+		    zpool_prop_to_name(ZPOOL_PROP_PARITYSET), 1);
+	}
+
+	/* A new pool has no shadow image: drop one of an older run. */
+	if (ztest_opts.zo_parity)
+		ztest_parity_reset();
 
 	/*
 	 * We don't expect the pool to suspend unless maxfaults == 0,
@@ -9580,6 +11476,30 @@ main(int argc, char **argv)
 	}
 	ASSERT3U(ztest_opts.zo_datasets, ==, ztest_shared_hdr->zh_ds_count);
 
+	/*
+	 * Parity set mode turns all the verifiers on.  The consumer thread of
+	 * ztest says which txgs are applied, so the test hook that applies old
+	 * txgs by itself stays off.  Children re-exec and do not run
+	 * process_options(), so this is the common place; a -o option below
+	 * overrides it.
+	 */
+	if (ztest_opts.zo_parity) {
+		zfs_parity_verify = PARITY_VERIFY_ALLOC |
+		    PARITY_VERIFY_RECORD | PARITY_VERIFY_FINAL |
+		    PARITY_VERIFY_RELEASE;
+		zfs_parity_test_auto_apply = 0;
+		/*
+		 * The default record limit of 5% of the pool is a few
+		 * MB on a ztest pool: it throttles and drops so often that the
+		 * rebuild check and the void injection rarely run.  One pass
+		 * in four keeps it (the throttle path stays covered); the
+		 * others use the fixed byte limit only.  Each pass is a new
+		 * process; the random source is not ready here.
+		 */
+		if (getpid() % 4 != 0)
+			zfs_parity_max_record_pct = 0;
+	}
+
 	err = ztest_set_global_vars();
 	if (err != 0 && !fd_data_str) {
 		/* error message done by ztest_set_global_vars */
@@ -9769,6 +11689,8 @@ main(int argc, char **argv)
 		(void) printf("%d killed, %d completed, %.0f%% kill rate\n",
 		    kills, iters - kills, (100.0 * kills) / MAX(1, iters));
 	}
+
+	ztest_parity_gate(zs);
 
 	kmem_free(cmd, MAXNAMELEN);
 

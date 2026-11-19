@@ -1,0 +1,328 @@
+# SPDX-License-Identifier: CDDL-1.0
+#
+# This file and its contents are supplied under the terms of the
+# Common Development and Distribution License ("CDDL"), version 1.0.
+# You may only use this file in accordance with the terms of version
+# 1.0 of the CDDL.
+#
+# A full copy of the text of the CDDL should have accompanied this
+# source.  A copy of the CDDL is also available via the Internet at
+# https://opensource.org/license/CDDL-1.0.
+#
+
+#
+# Copyright (c) 2026 John White. All rights reserved.
+#
+
+. $STF_SUITE/include/libtest.shlib
+. $STF_SUITE/tests/functional/parity_set/default.cfg
+
+#
+# Helpers of the parity_set test group.
+#
+# The tests use a pool of one file vdev. No parity daemon runs in these tests.
+# A record is applied in one of these ways:
+#   - the tunable zfs_parity_test_auto_apply (a transaction group that is
+#     older than the value counts as applied), or
+#   - "zpool parity drop", which discards all records.
+#
+# The tests expect "zpool parity status -Hp <pool>" to print one line for
+# each field: the name, a tab and the value. The names are state (off, on,
+# draining or dropping), applied_txg, pending_bytes and held_bytes.
+# A pool that dropped its records at the hard limit prints a line with the
+# text "not protected, resync needed".
+#
+
+#
+# Skip the test when this ZFS build lacks a part of the feature.
+#
+function parity_require
+{
+	zpool upgrade -v 2>&1 | grep -q "parity_records" ||
+	    log_unsupported "no parity_records feature in this build"
+	zpool parity 2>&1 | grep -q "unrecognized command" &&
+	    log_unsupported "no 'zpool parity' command in this build"
+	return 0
+}
+
+#
+# Skip the test when a tunable does not exist.
+#
+function parity_require_tunable # NAME
+{
+	tunable_exists $1 || log_unsupported "no tunable $1 in this build"
+}
+
+#
+# Set a tunable that may be missing in an older build. Do nothing then.
+#
+function parity_set_tunable # NAME value
+{
+	tunable_exists $1 || return 0
+	set_tunable64 $1 $2
+}
+
+function parity_reset_tunables
+{
+	parity_set_tunable PARITY_VERIFY $PARITY_VERIFY_DEFAULT
+	parity_set_tunable PARITY_TEST_INJECT $PARITY_TEST_INJECT_DEFAULT
+	parity_set_tunable PARITY_TEST_AUTO_APPLY \
+	    $PARITY_TEST_AUTO_APPLY_DEFAULT
+	parity_set_tunable PARITY_SUSPEND_RELEASE \
+	    $PARITY_SUSPEND_RELEASE_DEFAULT
+	parity_set_tunable PARITY_RELEASE_LIMIT $PARITY_RELEASE_LIMIT_DEFAULT
+	parity_set_tunable PARITY_REPAIR_WAIT_MS \
+	    $PARITY_REPAIR_WAIT_MS_DEFAULT
+	parity_set_tunable PARITY_ALLOW_EXPAND $PARITY_ALLOW_EXPAND_DEFAULT
+	parity_set_tunable PARITY_IMPORT_OVERRIDE \
+	    $PARITY_IMPORT_OVERRIDE_DEFAULT
+	parity_set_tunable PARITY_PACE_IDLE_MS $PARITY_PACE_IDLE_MS_DEFAULT
+}
+
+#
+# Create the test pool on one file vdev. Extra arguments go to zpool create.
+#
+function parity_create_pool # [zpool create args]
+{
+	rm -f $PARITY_VDEV
+	log_must truncate -s $PARITY_VDEV_SIZE $PARITY_VDEV
+	log_must zpool create -f "$@" $TESTPOOL $PARITY_VDEV
+}
+
+#
+# Create sparse file vdevs for tests of members with several
+# top-level vdevs.  Pool names make these
+# paths unique when the test runner runs more than one case at a time.
+#
+function parity_cols_prepare
+{
+	log_must mkdir -p "$PARITY_COLS_DIR"
+	# empty first: a file left by an earlier test keeps its old pool label
+	typeset f
+	for f in "$PARITY_COLS_VDEV0" "$PARITY_COLS_VDEV1" "$PARITY_COLS_VDEV2" \
+	    "$PARITY_COLS_VDEV3"; do
+		log_must truncate -s 0 "$f"
+	done
+	log_must truncate -s $PARITY_VDEV_SIZE "$PARITY_COLS_VDEV0"
+	log_must truncate -s $PARITY_VDEV_SIZE "$PARITY_COLS_VDEV1"
+	log_must truncate -s $PARITY_VDEV_SIZE "$PARITY_COLS_VDEV2"
+	log_must truncate -s $PARITY_VDEV_SIZE "$PARITY_COLS_VDEV3"
+}
+
+#
+# Destroy pools made by tests of members with several top-level vdevs.
+# File vdevs stay in the test directory and are reused with -f by the
+# next run.
+#
+function parity_cols_cleanup # [extra pool]
+{
+	poolexists $TESTPOOL && destroy_pool $TESTPOOL
+	if [[ -n "$1" ]]; then
+		poolexists $1 && destroy_pool $1
+	fi
+}
+
+#
+# Read INFO columns and check their fields and the expected data leaves.
+#
+function parity_cols_check_columns # pool column-count [leaf paths ...]
+{
+	typeset pool=$1 count=$2
+	shift 2
+	log_must libzfs_input_check --parity-columns "$pool" "$count" "$@"
+}
+
+#
+# Turn the parity set on and write until the pool has records. The records
+# start a few transaction groups after the property is set.
+#
+function parity_arm # [pool]
+{
+	typeset pool=${1:-$TESTPOOL}
+	typeset i
+
+	log_must zpool set parityset=on $pool
+	for i in 1 2 3 4; do
+		log_must file_write -o create -f /$pool/arm.$i -b 4096 \
+		    -c 1 -d R
+		sync_pool $pool
+	done
+}
+
+#
+# Write a file of "count" MiB of random data, then sync the pool.
+#
+function parity_write # file count [pool]
+{
+	typeset file=$1
+	typeset count=$2
+	typeset pool=${3:-$TESTPOOL}
+
+	log_must file_write -o create -f $file -b 1048576 -c $count -d R
+	sync_pool $pool
+}
+
+#
+# Start the same write in the background. The pid is in PARITY_WRITER_PID.
+#
+function parity_write_bg # file count
+{
+	file_write -o create -f $1 -b 1048576 -c $2 -d R &
+	PARITY_WRITER_PID=$!
+}
+
+function parity_stop_writer
+{
+	if [[ -n $PARITY_WRITER_PID ]]; then
+		kill -9 $PARITY_WRITER_PID 2>/dev/null
+		wait $PARITY_WRITER_PID 2>/dev/null
+		PARITY_WRITER_PID=""
+	fi
+}
+
+#
+# Print one field of "zpool parity status".
+#
+function parity_status_value # key [pool]
+{
+	typeset key=$1
+	typeset pool=${2:-$TESTPOOL}
+
+	zpool parity status -Hp $pool 2>/dev/null |
+	    awk -F'\t' -v k="$key" '$1 == k { print $2 }'
+}
+
+function parity_leaked_zap
+{
+	zdb -dddd "$TESTPOOL" 1 | awk \
+	    '$1 == "org.openzfs:parity_leaked_bytes" { print $3 }'
+}
+
+function parity_state
+{
+	parity_status_value state $1
+}
+
+function parity_pending
+{
+	parity_status_value pending_bytes $1
+}
+
+function parity_held
+{
+	parity_status_value held_bytes $1
+}
+
+function parity_free # [pool]
+{
+	zpool list -Hp -o free ${1:-$TESTPOOL}
+}
+
+#
+# Return 0 when the pool has at least "bytes" of free space. Force a
+# transaction group first, because the space comes back in a sync task.
+#
+function parity_free_at_least # bytes [pool]
+{
+	typeset pool=${2:-$TESTPOOL}
+
+	zpool sync $pool || return 1
+	(( $(parity_free $pool) >= $1 ))
+}
+
+#
+# Run a command each second until it succeeds or the time is up.
+#
+function parity_wait # timeout command...
+{
+	typeset timeout=$1
+	typeset i
+	shift
+
+	for (( i = 0; i < timeout; i++ )); do
+		eval "$@" && return 0
+		sleep 1
+	done
+	return 1
+}
+
+#
+# Events. "class" is the part after sysevent.fs.zfs.
+#
+function parity_event_seen # class
+{
+	zpool events -v 2>/dev/null |
+	    grep -q "class = \"sysevent.fs.zfs.$1\""
+}
+
+#
+# Print one payload field of the newest event of a class.
+#
+function parity_event_field # class field
+{
+	zpool events -v 2>/dev/null | awk -v c="sysevent.fs.zfs.$1" -v k="$2" '
+	    BEGIN { RS = ""; FS = "\n" }
+	    index($0, "class = \"" c "\"") {
+		for (i = 1; i <= NF; i++) {
+			line = $i
+			sub(/^[ \t]+/, "", line)
+			n = index(line, " = ")
+			if (n > 0 && substr(line, 1, n - 1) == k) {
+				v = substr(line, n + 3)
+				gsub(/"/, "", v)
+				val = v
+			}
+		}
+	    }
+	    END { print val }'
+}
+
+function parity_wait_event # class [timeout]
+{
+	parity_wait ${2:-60} parity_event_seen $1
+}
+
+#
+# The usual cleanup of a test.
+#
+function parity_cleanup
+{
+	parity_stop_writer
+	zinject -c all >/dev/null 2>&1
+	parity_reset_tunables
+	poolexists $TESTPOOL && destroy_pool $TESTPOOL
+	rm -f $PARITY_VDEV $PARITY_VDEV2
+}
+
+#
+# Make a pool with leaked held space: arm it, write and remove a file,
+# then drop with every record read failing.  Prints nothing; the caller reads
+# leaked_bytes.
+#
+function parity_make_leak
+{
+	parity_create_pool
+	parity_arm
+	parity_write /$TESTPOOL/data $PARITY_DATA_MB
+	log_must rm /$TESTPOOL/data
+	sync_pool $TESTPOOL
+	log_must test "$(parity_held)" -gt 0
+	log_must set_tunable64 PARITY_TEST_INJECT 32
+	log_must zpool set parityset=off $TESTPOOL
+	log_must zpool parity drop -f $TESTPOOL
+	log_must parity_wait 60 \
+	    'sync_pool $TESTPOOL; test "$(parity_state)" == "off"'
+	log_must set_tunable64 PARITY_TEST_INJECT 0
+	log_must test "$(parity_status_value leaked_bytes)" -gt 0
+}
+
+#
+# Export the pool, save zdb's reclaim output to $1, then import the pool.
+#
+function parity_zdb_leaks # file
+{
+	log_must zpool export $TESTPOOL
+	zdb -e -p $PARITY_DIR -b $TESTPOOL > $1 2>&1
+	log_must zpool import -d $PARITY_DIR $TESTPOOL
+	log_must grep -q '^parity reclaim: pool_guid ' $1
+}
