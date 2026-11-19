@@ -2789,6 +2789,7 @@ typedef struct parity_kstat {
 	kstat_named_t	pk_repair_declined;
 	kstat_named_t	pk_repair_rejected;
 	kstat_named_t	pk_repair_written;
+	kstat_named_t	pk_read_bytes;
 } parity_kstat_t;
 
 static const parity_kstat_t parity_kstat_template = {
@@ -2823,6 +2824,7 @@ static const parity_kstat_t parity_kstat_template = {
 	{ "repair_declined",	KSTAT_DATA_UINT64 },
 	{ "repair_rejected",	KSTAT_DATA_UINT64 },
 	{ "repair_written",	KSTAT_DATA_UINT64 },
+	{ "read_bytes",		KSTAT_DATA_UINT64 },
 };
 
 static int
@@ -2880,6 +2882,7 @@ parity_kstat_update(kstat_t *ksp, int rw)
 	    atomic_load_64(&ps->ps_stat_repair_rejected);
 	pk->pk_repair_written.value.ui64 =
 	    atomic_load_64(&ps->ps_stat_repair_written);
+	pk->pk_read_bytes.value.ui64 = atomic_load_64(&ps->ps_stat_read_bytes);
 	return (0);
 }
 

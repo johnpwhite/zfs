@@ -2805,6 +2805,90 @@ test_parity_history_gap(const char *pool)
 }
 
 /*
+ * --parity-readv: READV the pending ALLOC records of 64 KiB or more (at most
+ * ZPARITY_READV_MAX_ENTRIES; the small metadata blocks of the arm come
+ * first) in one call and print "readv <entries> <bytes>".  The test
+ * compares <bytes> with the growth of the kstat read_bytes: a reply that
+ * did not fit the first buffer made the kernel read every block twice.
+ */
+static int
+test_parity_readv_once(const char *pool)
+{
+	nvlist_t *out = NULL, *rd = NULL;
+	uint64_t *entries, *indexes, *lengths;
+	uint64_t words[ZPARITY_READV_MAX_ENTRIES * PARITY_ENTRY_WORDS];
+	uint64_t idx[ZPARITY_READV_MAX_ENTRIES], bytes = 0;
+	uint_t nwords = 0, nindexes = 0, nlengths = 0, n = 0, nerr = 0;
+	int32_t *errors;
+	int error, result = 1;
+
+	error = lzc_parity_records(pool, 0, 0, 4096, &out);
+	if (error != 0) {
+		(void) fprintf(stderr, "parity RECORDS failed: %s\n",
+		    strerror(error));
+		goto out;
+	}
+	entries = fnvlist_lookup_uint64_array(out, ZPARITY_ENTRIES, &nwords);
+	indexes = fnvlist_lookup_uint64_array(out, ZPARITY_INDEXES, &nindexes);
+	if (entries == NULL || indexes == NULL ||
+	    nwords % PARITY_ENTRY_WORDS != 0 ||
+	    nindexes != nwords / PARITY_ENTRY_WORDS) {
+		(void) fprintf(stderr,
+		    "parity RECORDS returned invalid entries\n");
+		goto out;
+	}
+	for (uint_t i = 0; i < nindexes && n < ZPARITY_READV_MAX_ENTRIES;
+	    i++) {
+		uint64_t *entry = &entries[i * PARITY_ENTRY_WORDS];
+		uint64_t kind = entry[PARITY_EW_KIND];
+		const blkptr_t *bp = (const blkptr_t *)&entry[PARITY_EW_BP];
+
+		if ((kind & 0xff) != PARITY_KIND_ALLOC ||
+		    ((kind >> 8) & 3) != 0 ||
+		    DVA_GET_ASIZE(&bp->blk_dva[0]) < 65536)
+			continue;
+		memcpy(&words[n * PARITY_ENTRY_WORDS], entry,
+		    PARITY_ENTRY_BYTES);
+		idx[n++] = indexes[i];
+	}
+	if (n == 0) {
+		(void) fprintf(stderr,
+		    "parity RECORDS had no large ALLOC entry\n");
+		goto out;
+	}
+	error = lzc_parity_readv(pool, words, n, idx, &rd);
+	if (error != 0) {
+		(void) fprintf(stderr, "parity READV failed: %s\n",
+		    strerror(error));
+		goto out;
+	}
+	errors = fnvlist_lookup_int32_array(rd, ZPARITY_READ_ERRORS, &nerr);
+	lengths = fnvlist_lookup_uint64_array(rd, ZPARITY_DATA_LENGTHS,
+	    &nlengths);
+	if (nerr != n || nlengths != n) {
+		(void) fprintf(stderr, "parity READV returned %u errors and "
+		    "%u lengths for %u entries\n", nerr, nlengths, n);
+		goto out;
+	}
+	for (uint_t i = 0; i < n; i++) {
+		if (errors[i] != 0) {
+			(void) fprintf(stderr, "parity READV of entry %u "
+			    "failed: %d\n", i, errors[i]);
+			goto out;
+		}
+		bytes += lengths[i];
+	}
+	(void) printf("readv %u %llu\n", n, (u_longlong_t)bytes);
+	result = 0;
+out:
+	if (rd != NULL)
+		fnvlist_free(rd);
+	if (out != NULL)
+		fnvlist_free(out);
+	return (result);
+}
+
+/*
  * --parity-blocks-read: READ every BLOCKS entry of the applied state, after
  * the pool wrote again and released the record of that txg.  READV must also
  * accept them.  A set scrub depends on this.
@@ -3245,6 +3329,7 @@ main(int argc, const char *argv[])
 	boolean_t parity_apply_last = B_FALSE;
 	boolean_t parity_history_gap = B_FALSE;
 	boolean_t parity_blocks_read = B_FALSE;
+	boolean_t parity_readv = B_FALSE;
 	boolean_t parity_dtl_read = B_FALSE;
 	boolean_t parity_blocks_windows = B_FALSE;
 	boolean_t parity_map = B_FALSE;
@@ -3297,6 +3382,9 @@ main(int argc, const char *argv[])
 	    strcmp(argv[1], "--parity-blocks-read") == 0) {
 		pool = argv[2];
 		parity_blocks_read = B_TRUE;
+	} else if (argc == 3 && strcmp(argv[1], "--parity-readv") == 0) {
+		pool = argv[2];
+		parity_readv = B_TRUE;
 	} else if (argc == 3 &&
 	    strcmp(argv[1], "--parity-dtl-read") == 0) {
 		pool = argv[2];
@@ -3333,7 +3421,8 @@ main(int argc, const char *argv[])
 		    "--parity-policy | --parity-baseline | "
 		    "--parity-label-current | --parity-apply | "
 		    "--parity-apply-last | --parity-history-gap | "
-		    "--parity-blocks-read | --parity-dtl-read | --parity-map | "
+		    "--parity-blocks-read | --parity-readv | "
+		    "--parity-dtl-read | --parity-map | "
 		    "--parity-map-stress] <pool>\n"
 		    "       %s --parity-columns <pool> <count> <leaf>...\n",
 		    argv[0], argv[0]);
@@ -3376,6 +3465,8 @@ main(int argc, const char *argv[])
 		unexpected_failures = test_parity_history_gap(pool) != 0;
 	else if (parity_blocks_read)
 		unexpected_failures = test_parity_blocks_read(pool) != 0;
+	else if (parity_readv)
+		unexpected_failures = test_parity_readv_once(pool) != 0;
 	else if (parity_dtl_read)
 		unexpected_failures = test_parity_dtl_read(pool) != 0;
 	else if (parity_map)

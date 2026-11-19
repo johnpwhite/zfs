@@ -2050,6 +2050,7 @@ nobase_dist_datadir_zfs_tests_tests_SCRIPTS += \
 	functional/parity_set/parity_onstall_wait_pos.ksh \
 	functional/parity_set/parity_pace_pos.ksh \
 	functional/parity_set/parity_policy_neg.ksh \
+	functional/parity_set/parity_readv_once_pos.ksh \
 	functional/parity_set/parity_reclaim_neg.ksh \
 	functional/parity_set/parity_reclaim_pos.ksh \
 	functional/parity_set/parity_refuse_neg.ksh \

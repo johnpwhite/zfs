@@ -237,6 +237,7 @@ typedef struct spa_parity {
 	uint64_t	ps_stat_repair_declined;	/* no bytes */
 	uint64_t	ps_stat_repair_rejected;	/* bad checksum */
 	uint64_t	ps_stat_repair_written;	/* REPAIR wrote */
+	uint64_t	ps_stat_read_bytes;	/* READ and READV disk reads */
 	/*
 	 * Epoch and lineage state.  ps_epoch is written in syncing context or
 	 * at load, with ps_generation; the ring is under ps_lock.

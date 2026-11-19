@@ -59,7 +59,7 @@ typeset FIELDS="state generation set_guid start_txg applied_txg synced_txg \
     record_bytes max_record_bytes max_held_bytes leaked_bytes throttle \
     throttled_ms applied_age_ms unprotected drop_pending record_txgs entries \
     released drops repair_requests repair_supplied repair_declined \
-    repair_rejected repair_written"
+    repair_rejected repair_written read_bytes"
 
 function pk_present
 {

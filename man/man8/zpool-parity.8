@@ -310,6 +310,10 @@ that failed the block checksum (also for
 Blocks that a
 .Sy REPAIR
 call wrote back.
+.It Sy read_bytes
+Bytes that the service read from disk through the pool to update parity, since
+the pool was loaded.
+About equal to the bytes it applied; much more shows reads done twice.
 .El
 .
 .Sh EXIT STATUS

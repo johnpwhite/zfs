@@ -807,6 +807,7 @@ parity_read_verified(spa_t *spa, const parity_ent_t *pe, void *buf)
 				error = rerr;
 			continue;
 		}
+		atomic_add_64(&spa->spa_parity->ps_stat_read_bytes, pe->pe_len);
 		if (pe->pe_nocksum || parity_ent_cksum(spa, pe, buf) == 0) {
 			error = 0;
 			break;

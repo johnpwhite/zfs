@@ -240,6 +240,19 @@ lzc_ioctl(zfs_ioc_t ioc, const char *name,
 		if (ioc == ZFS_IOC_CHANNEL_PROGRAM) {
 			zc.zc_nvlist_dst_size = fnvlist_lookup_uint64(source,
 			    ZCP_ARG_MEMLIMIT);
+		} else if (ioc == ZFS_IOC_PARITY_READ ||
+		    ioc == ZFS_IOC_PARITY_READV) {
+			/*
+			 * The kernel reads every block before it packs the
+			 * reply.  A reply that does not fit makes it read
+			 * every block again, so the first buffer holds the
+			 * largest reply: ZPARITY_READV_MAX_BYTES of data
+			 * (more than one block) and the per-entry arrays.
+			 * The pages that the reply does not fill are never
+			 * touched.
+			 */
+			zc.zc_nvlist_dst_size = MAX(size * 2,
+			    ZPARITY_READV_MAX_BYTES + 1024 * 1024);
 		} else if (ioc >= ZFS_IOC_PARITY_INFO &&
 		    ioc <= ZFS_IOC_PARITY_DROP) {
 			/*

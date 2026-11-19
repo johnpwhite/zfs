@@ -916,7 +916,7 @@ tags = ['functional', 'online_offline']
 
 [tests/functional/parity_set]
 tests = ['parity_enable_pos', 'parity_hold_pos', 'parity_trim_pos',
-    'parity_kstat_pos',
+    'parity_kstat_pos', 'parity_readv_once_pos',
     'parity_cols_eligible_pos', 'parity_cols_eligible_neg',
     'parity_cols_add_pos', 'parity_cols_add_neg', 'parity_cols_attach_pos',
     'parity_cols_degraded_pos', 'parity_cols_rebuild_read_neg',
