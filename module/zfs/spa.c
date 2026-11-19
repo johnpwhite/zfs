@@ -2244,6 +2244,12 @@ spa_sync_time_logger(spa_t *spa, uint64_t txg, boolean_t force)
 }
 
 static void
+spa_unload_sync_time_logger_sync(void *arg, dmu_tx_t *tx)
+{
+	spa_sync_time_logger(arg, dmu_tx_get_txg(tx), B_TRUE);
+}
+
+static void
 spa_unload_sync_time_logger(spa_t *spa)
 {
 	uint64_t txg;
@@ -2251,7 +2257,15 @@ spa_unload_sync_time_logger(spa_t *spa)
 	VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT));
 
 	txg = dmu_tx_get_txg(tx);
-	spa_sync_time_logger(spa, txg, B_TRUE);
+	/*
+	 * Write the MOS directory in syncing context, as spa_sync() does.
+	 * A write from open context dirties the directory for this txg while
+	 * the previous txg may still be syncing, and a syncing-context writer
+	 * of the same object (dsl_scan, the DDT, the BRT) then trips the
+	 * txg-order assertion in dbuf_dirty().
+	 */
+	dsl_sync_task_nowait(spa_get_dsl(spa),
+	    spa_unload_sync_time_logger_sync, spa, tx);
 
 	dmu_tx_commit(tx);
 
