@@ -716,9 +716,12 @@ the normal limits and the
 policy apply.
 With
 .Sy off ,
-writes do not wait for parity until the normal delay curve starts.
+writes do not wait for parity until the normal delay curve starts, and a long
+write can make the pool reach the hard limit and apply the
+.Sy parity_onstall
+policy.
 The default value is
-.Sy off .
+.Sy on .
 .It Sy parityset Ns = Ns Sy on Ns | Ns Sy off
 Controls whether the pool is a member of a parity set.
 A parity set is a group of independent single-disk pools, each of which can be

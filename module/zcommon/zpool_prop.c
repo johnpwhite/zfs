@@ -237,7 +237,7 @@ zpool_prop_init(void)
 	zprop_register_number(ZPOOL_PROP_PARITY_GROW_MAX, "parity_grow_max", 0,
 	    PROP_DEFAULT, ZFS_TYPE_POOL, "<size, or 0=none>", "PARITYGROW",
 	    B_FALSE, sfeatures);
-	zprop_register_index(ZPOOL_PROP_PARITY_PACE, "parity_pace", 0,
+	zprop_register_index(ZPOOL_PROP_PARITY_PACE, "parity_pace", 1,
 	    PROP_DEFAULT, ZFS_TYPE_POOL, "on | off", "PARITYPACE",
 	    boolean_table, sfeatures);
 

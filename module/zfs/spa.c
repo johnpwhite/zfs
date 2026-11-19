@@ -5652,6 +5652,9 @@ spa_ld_get_props(spa_t *spa)
 	nvlist_free(mos_config);
 
 	spa->spa_delegation = zpool_prop_default_numeric(ZPOOL_PROP_DELEGATION);
+	/* Not 0: a pool that never set it must still pace. */
+	spa->spa_parity_pace =
+	    zpool_prop_default_numeric(ZPOOL_PROP_PARITY_PACE);
 
 	error = spa_dir_prop(spa, DMU_POOL_PROPS, &spa->spa_pool_props_object,
 	    B_FALSE);
@@ -7725,6 +7728,8 @@ spa_create(const char *pool, nvlist_t *nvroot, nvlist_t *props,
 	spa->spa_autoexpand = zpool_prop_default_numeric(ZPOOL_PROP_AUTOEXPAND);
 	spa->spa_multihost = zpool_prop_default_numeric(ZPOOL_PROP_MULTIHOST);
 	spa->spa_autotrim = zpool_prop_default_numeric(ZPOOL_PROP_AUTOTRIM);
+	spa->spa_parity_pace =
+	    zpool_prop_default_numeric(ZPOOL_PROP_PARITY_PACE);
 	spa->spa_dedup_table_quota =
 	    zpool_prop_default_numeric(ZPOOL_PROP_DEDUP_TABLE_QUOTA);
 
