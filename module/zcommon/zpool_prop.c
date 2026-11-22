@@ -84,6 +84,12 @@ zpool_prop_init(void)
 		{ NULL }
 	};
 
+	static const zprop_index_t parity_onstall_table[] = {
+		{ "continue",	ZPOOL_PARITY_ONSTALL_CONTINUE },
+		{ "wait",	ZPOOL_PARITY_ONSTALL_WAIT },
+		{ NULL }
+	};
+
 	static const zprop_index_t failuremode_table[] = {
 		{ "wait",	ZIO_FAILURE_MODE_WAIT },
 		{ "continue",	ZIO_FAILURE_MODE_CONTINUE },
@@ -217,6 +223,24 @@ zpool_prop_init(void)
 	zprop_register_index(ZPOOL_PROP_AUTOTRIM, "autotrim",
 	    SPA_AUTOTRIM_OFF, PROP_DEFAULT, ZFS_TYPE_POOL,
 	    "on | off", "AUTOTRIM", boolean_table, sfeatures);
+	zprop_register_index(ZPOOL_PROP_PARITYSET, "parityset", 0, PROP_DEFAULT,
+	    ZFS_TYPE_POOL, "on | off", "PARITYSET", boolean_table, sfeatures);
+	zprop_register_index(ZPOOL_PROP_PARITY_ONSTALL, "parity_onstall",
+	    ZPOOL_PARITY_ONSTALL_CONTINUE, PROP_DEFAULT, ZFS_TYPE_POOL,
+	    "continue | wait", "PARITYSTALL", parity_onstall_table, sfeatures);
+	zprop_register_number(ZPOOL_PROP_PARITY_MAX_RECORDS,
+	    "parity_max_records", 0, PROP_DEFAULT, ZFS_TYPE_POOL,
+	    "<size, or 0=default>", "PARITYREC", B_FALSE, sfeatures);
+	zprop_register_number(ZPOOL_PROP_PARITY_MAX_HELD, "parity_max_held", 0,
+	    PROP_DEFAULT, ZFS_TYPE_POOL, "<percent, or 0=default>",
+	    "PARITYHELD", B_FALSE, sfeatures);
+	zprop_register_number(ZPOOL_PROP_PARITY_GROW_MAX, "parity_grow_max", 0,
+	    PROP_DEFAULT, ZFS_TYPE_POOL, "<size, or 0=none>", "PARITYGROW",
+	    B_FALSE, sfeatures);
+	zprop_register_index(ZPOOL_PROP_PARITY_PACE, "parity_pace", 1,
+	    PROP_DEFAULT, ZFS_TYPE_POOL, "on | off", "PARITYPACE",
+	    boolean_table, sfeatures);
+
 
 	/* hidden properties */
 	zprop_register_hidden(ZPOOL_PROP_NAME, "name", PROP_TYPE_STRING,

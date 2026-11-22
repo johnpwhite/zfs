@@ -38,6 +38,7 @@
 #include <sys/abd.h>
 #include <sys/brt.h>
 #include <sys/wmsum.h>
+#include <sys/spa_lag.h>
 
 /*
  * The ZFS Intent Log (ZIL) saves "transaction records" (itxs) of system
@@ -463,11 +464,14 @@ zil_kstat_values_update(zil_kstat_values_t *zs, zil_sums_t *zil_sums)
 
 /*
  * Parse the intent log, and call parse_func for each valid record within.
+ * With keep_state false the walk does not touch the zilog's shared state
+ * (the block pointer tree and the zl_parse_* results), so it can run on a
+ * live log.  A block can then be seen twice, and the caller must allow that.
  */
-int
-zil_parse(zilog_t *zilog, zil_parse_blk_func_t *parse_blk_func,
+static int
+zil_parse_impl(zilog_t *zilog, zil_parse_blk_func_t *parse_blk_func,
     zil_parse_lr_func_t *parse_lr_func, void *arg, uint64_t txg,
-    boolean_t decrypt)
+    boolean_t decrypt, boolean_t keep_state)
 {
 	const zil_header_t *zh = zilog->zl_header;
 	boolean_t claimed = !!zh->zh_claim_txg;
@@ -495,7 +499,8 @@ zil_parse(zilog_t *zilog, zil_parse_blk_func_t *parse_blk_func,
 	 * If the log has been claimed, stop if we encounter a sequence
 	 * number greater than the highest claimed sequence number.
 	 */
-	zil_bp_tree_init(zilog);
+	if (keep_state)
+		zil_bp_tree_init(zilog);
 
 	for (blk = zh->zh_log; !BP_IS_HOLE(&blk); blk = next_blk) {
 		uint64_t blk_seq = blk.blk_cksum.zc_word[ZIL_ZC_SEQ];
@@ -572,15 +577,26 @@ zil_parse(zilog_t *zilog, zil_parse_blk_func_t *parse_blk_func,
 		arc_buf_destroy(abuf, &abuf);
 	}
 done:
-	zilog->zl_parse_error = error;
-	zilog->zl_parse_blk_seq = max_blk_seq;
-	zilog->zl_parse_lr_seq = max_lr_seq;
-	zilog->zl_parse_blk_count = blk_count;
-	zilog->zl_parse_lr_count = lr_count;
+	if (keep_state) {
+		zilog->zl_parse_error = error;
+		zilog->zl_parse_blk_seq = max_blk_seq;
+		zilog->zl_parse_lr_seq = max_lr_seq;
+		zilog->zl_parse_blk_count = blk_count;
+		zilog->zl_parse_lr_count = lr_count;
 
-	zil_bp_tree_fini(zilog);
+		zil_bp_tree_fini(zilog);
+	}
 
 	return (error);
+}
+
+int
+zil_parse(zilog_t *zilog, zil_parse_blk_func_t *parse_blk_func,
+    zil_parse_lr_func_t *parse_lr_func, void *arg, uint64_t txg,
+    boolean_t decrypt)
+{
+	return (zil_parse_impl(zilog, parse_blk_func, parse_lr_func, arg, txg,
+	    decrypt, B_TRUE));
 }
 
 static int
@@ -611,6 +627,17 @@ zil_noop_log_record(zilog_t *zilog, const lr_t *lrc, void *tx,
 {
 	(void) zilog, (void) lrc, (void) tx, (void) first_txg;
 	return (0);
+}
+
+/*
+ * Call blk_func for each block of the log chain, without the shared state of
+ * zil_parse().  This is safe on a live log; a block can be seen twice.
+ */
+int
+zil_walk_blocks(zilog_t *zilog, zil_parse_blk_func_t *blk_func, void *arg)
+{
+	return (zil_parse_impl(zilog, blk_func, zil_noop_log_record, arg, 0,
+	    B_FALSE, B_FALSE));
 }
 
 static int
@@ -1041,8 +1068,11 @@ zil_create(zilog_t *zilog)
 
 		error = zio_alloc_zil(zilog->zl_spa, zilog->zl_os, txg, &blk,
 		    ZIL_MIN_BLKSZ, ZIL_MIN_BLKSZ, &slog, B_TRUE);
-		if (error == 0)
+		if (error == 0) {
 			zil_init_log_chain(zilog, &blk);
+			/* The BP is final now; a lagging consumer copies it. */
+			spa_lag_write_ready(zilog->zl_spa, &blk, txg);
+		}
 	}
 
 	/*
@@ -2162,6 +2192,13 @@ next_lwb:
 	 */
 	bp->blk_cksum = lwb->lwb_blk.blk_cksum;
 	bp->blk_cksum.zc_word[ZIL_ZC_SEQ]++;
+
+	/*
+	 * The next block's BP is final now (checksum type and verifier); a
+	 * lagging consumer replaces the copy it took at the allocation.
+	 */
+	if (error == 0)
+		spa_lag_write_ready(spa, bp, txg);
 
 	/*
 	 * Reduce TXG open time by incrementing inflight counter and committing

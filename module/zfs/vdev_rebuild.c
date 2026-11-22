@@ -23,6 +23,7 @@
 #include <sys/spa_impl.h>
 #include <sys/metaslab_impl.h>
 #include <sys/vdev_rebuild.h>
+#include <sys/spa_parity_impl.h>
 #include <sys/zio.h>
 #include <sys/dmu_tx.h>
 #include <sys/arc.h>
@@ -157,9 +158,34 @@ vdev_rebuild_should_stop(vdev_t *vd)
 	    vd->vdev_rebuild_reset_wanted);
 }
 
+/* Does a leaf under vd still have a MISSING DTL, writeable or not? */
+static boolean_t
+vdev_rebuild_dtl_missing(vdev_t *vd)
+{
+	boolean_t missing = B_FALSE;
+
+	if (vd->vdev_children == 0) {
+		mutex_enter(&vd->vdev_dtl_lock);
+		missing = !zfs_range_tree_is_empty(vd->vdev_dtl[DTL_MISSING]);
+		mutex_exit(&vd->vdev_dtl_lock);
+		return (missing);
+	}
+	for (uint64_t c = 0; c < vd->vdev_children && !missing; c++)
+		missing = vdev_rebuild_dtl_missing(vd->vdev_child[c]);
+	return (missing);
+}
+
 /*
  * Determine if the rebuild should be canceled.  This may happen when all
  * vdevs with MISSING DTLs are detached.
+ *
+ * vdev_resilver_needed() also says no while a leaf is not writeable, for
+ * example for a moment during a reopen.  On a parity set member the
+ * rebuild goes on while a leaf still has a MISSING DTL: after a cancel
+ * only a scrub or resilver could clear that DTL, and they copy only live
+ * blocks, so vdev_dtl_should_excise() refuses them and the replace would
+ * never end.  A leaf that stays unwriteable makes the rebuild end with
+ * errors, which keeps the DTL.
  */
 static boolean_t
 vdev_rebuild_should_cancel(vdev_t *vd)
@@ -167,8 +193,12 @@ vdev_rebuild_should_cancel(vdev_t *vd)
 	vdev_rebuild_t *vr = &vd->vdev_rebuild_config;
 	vdev_rebuild_phys_t *vrp = &vr->vr_rebuild_phys;
 
-	if (!vdev_resilver_needed(vd, &vrp->vrp_min_txg, &vrp->vrp_max_txg))
+	if (!vdev_resilver_needed(vd, &vrp->vrp_min_txg, &vrp->vrp_max_txg)) {
+		if (spa_parity_busy(vd->vdev_spa) &&
+		    vdev_rebuild_dtl_missing(vd))
+			return (B_FALSE);
 		return (B_TRUE);
+	}
 
 	return (B_FALSE);
 }

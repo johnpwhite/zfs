@@ -103,6 +103,11 @@
 .Nm
 .Fl -anyraid-map
 .Ar poolname Op Ar vdev Ns …
+.Nm
+.Fl -parity
+.Op Fl v
+.Op Fl e Oo Fl V Oc Oo Fl p Ar path Oc Ns …
+.Ar poolname
 .
 .Sh DESCRIPTION
 The
@@ -470,6 +475,15 @@ Dump the contents of the block reference tables.
 Display the current uberblock.
 .It Fl -anyraid-map
 Display information about the mappings of one or all anyraid vdevs in the pool.
+.It Fl -parity
+Dump the parity records of a pool that is a member of a parity set:
+the record index and, for each unreleased transaction group, the allocations and
+frees that the parity software has not applied yet.
+Use
+.Fl v
+to list each recorded block pointer.
+See
+.Xr zpool-parity 8 .
 .El
 .Pp
 Other options:

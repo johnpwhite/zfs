@@ -359,6 +359,17 @@ while (( timeout == 0 )) || (( curtime <= (starttime + timeout) )); do
 	zopt="$zopt -J $ztest_seed"
 
 	#
+	# Run one iteration in five as a parity set member: one file vdev, the
+	# consumer thread and the rebuild check.  ztest -Z replaces the layout
+	# above (-K, -m, -r, -v) and turns off the options that need another
+	# layout (-X, -M), so it is safe to add to any iteration.  A raidz
+	# expansion run keeps its own layout.
+	#
+	if [[ $expand -eq 0 ]] && [[ $((RANDOM % 5)) -eq 0 ]]; then
+		zopt="$zopt -Z"
+	fi
+
+	#
 	# Exercise multihost on a fraction of the iterations rather than all
 	# of them: -M suppresses roughly a dozen other ztest operations, so
 	# running it everywhere would remove that coverage from the loop.

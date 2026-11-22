@@ -584,7 +584,7 @@
     <elf-symbol name='fletcher_4_superscalar4_ops' size='128' type='object-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
     <elf-symbol name='fletcher_4_superscalar_ops' size='128' type='object-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
     <elf-symbol name='libzfs_config_ops' size='16' type='object-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
-    <elf-symbol name='spa_feature_table' size='2744' type='object-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
+    <elf-symbol name='spa_feature_table' size='2800' type='object-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
     <elf-symbol name='zfeature_checks_disable' size='4' type='object-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
     <elf-symbol name='zfs_deleg_perm_tab' size='560' type='object-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
     <elf-symbol name='zfs_history_event_names' size='328' type='object-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
@@ -1423,14 +1423,6 @@
     </function-decl>
     <function-decl name='feof' visibility='default' binding='global' size-in-bits='64'>
       <parameter type-id='822cd80b'/>
-      <return type-id='95e97e5e'/>
-    </function-decl>
-    <function-decl name='statx' visibility='default' binding='global' size-in-bits='64'>
-      <parameter type-id='95e97e5e'/>
-      <parameter type-id='9d26089a'/>
-      <parameter type-id='95e97e5e'/>
-      <parameter type-id='f0981eeb'/>
-      <parameter type-id='31d265b7'/>
       <return type-id='95e97e5e'/>
     </function-decl>
     <function-decl name='statx' visibility='default' binding='global' size-in-bits='64'>
@@ -3197,7 +3189,13 @@
       <enumerator name='ZPOOL_PROP_SELOG_USED' value='96'/>
       <enumerator name='ZPOOL_PROP_SELOG_EXPANDSZ' value='97'/>
       <enumerator name='ZPOOL_PROP_SELOG_FRAGMENTATION' value='98'/>
-      <enumerator name='ZPOOL_NUM_PROPS' value='99'/>
+      <enumerator name='ZPOOL_PROP_PARITYSET' value='99'/>
+      <enumerator name='ZPOOL_PROP_PARITY_ONSTALL' value='100'/>
+      <enumerator name='ZPOOL_PROP_PARITY_MAX_RECORDS' value='101'/>
+      <enumerator name='ZPOOL_PROP_PARITY_MAX_HELD' value='102'/>
+      <enumerator name='ZPOOL_PROP_PARITY_GROW_MAX' value='103'/>
+      <enumerator name='ZPOOL_PROP_PARITY_PACE' value='104'/>
+      <enumerator name='ZPOOL_NUM_PROPS' value='105'/>
     </enum-decl>
     <typedef-decl name='zpool_prop_t' type-id='af1ba157' id='5d0c23fb'/>
     <typedef-decl name='regoff_t' type-id='95e97e5e' id='54a2a2a8'/>
@@ -3868,6 +3866,7 @@
   </abi-instr>
   <abi-instr address-size='64' path='lib/libzfs/libzfs_dataset.c' language='LANG_C99'>
     <class-decl name='prop_changelist' is-struct='yes' visibility='default' is-declaration-only='yes' id='d86edc51'/>
+    <type-decl name='long long unsigned int' size-in-bits='64' id='3a47d82b'/>
     <class-decl name='zprop_list' size-in-bits='448' is-struct='yes' visibility='default' id='bd9b4291'>
       <data-member access='public' layout-offset-in-bits='0'>
         <var-decl name='pl_prop' type-id='95e97e5e' visibility='default'/>
@@ -4510,11 +4509,11 @@
       <parameter type-id='95e97e5e'/>
       <return type-id='bd54fe1a'/>
     </function-decl>
-    <function-decl name='strtoul' visibility='default' binding='global' size-in-bits='64'>
+    <function-decl name='strtoull' visibility='default' binding='global' size-in-bits='64'>
       <parameter type-id='9d26089a'/>
       <parameter type-id='8c85230f'/>
       <parameter type-id='95e97e5e'/>
-      <return type-id='7359adad'/>
+      <return type-id='3a47d82b'/>
     </function-decl>
     <function-decl name='abort' visibility='default' binding='global' size-in-bits='64'>
       <return type-id='48b5725f'/>
@@ -5445,7 +5444,6 @@
     <array-type-def dimensions='1' type-id='95e97e5e' size-in-bits='64' id='e4266c7e'>
       <subrange length='2' type-id='7359adad' id='52efc4ef'/>
     </array-type-def>
-    <type-decl name='long long unsigned int' size-in-bits='64' id='3a47d82b'/>
     <array-type-def dimensions='1' type-id='002ac4a6' size-in-bits='56' id='08f7ce77'>
       <subrange length='7' type-id='7359adad' id='16fc326e'/>
     </array-type-def>
@@ -6396,6 +6394,21 @@
       <enumerator name='ZFS_IOC_POOL_PREFETCH' value='23128'/>
       <enumerator name='ZFS_IOC_DDT_PRUNE' value='23129'/>
       <enumerator name='ZFS_IOC_POOL_CONDENSE' value='23130'/>
+      <enumerator name='ZFS_IOC_PARITY_INFO' value='23131'/>
+      <enumerator name='ZFS_IOC_PARITY_RECORDS' value='23132'/>
+      <enumerator name='ZFS_IOC_PARITY_READ' value='23133'/>
+      <enumerator name='ZFS_IOC_PARITY_VERIFY' value='23134'/>
+      <enumerator name='ZFS_IOC_PARITY_MAP' value='23135'/>
+      <enumerator name='ZFS_IOC_PARITY_BLOCKS' value='23136'/>
+      <enumerator name='ZFS_IOC_PARITY_LABEL' value='23137'/>
+      <enumerator name='ZFS_IOC_PARITY_APPLIED' value='23138'/>
+      <enumerator name='ZFS_IOC_PARITY_REPAIR' value='23139'/>
+      <enumerator name='ZFS_IOC_PARITY_DROP' value='23140'/>
+      <enumerator name='ZFS_IOC_PARITY_READV' value='23141'/>
+      <enumerator name='ZFS_IOC_PARITY_CURRENT' value='23142'/>
+      <enumerator name='ZFS_IOC_PARITY_PROVIDER' value='23143'/>
+      <enumerator name='ZFS_IOC_PARITY_SUPPLY' value='23144'/>
+      <enumerator name='ZFS_IOC_PARITY_RECLAIM' value='23145'/>
       <enumerator name='ZFS_IOC_PLATFORM' value='23168'/>
       <enumerator name='ZFS_IOC_EVENTS_NEXT' value='23169'/>
       <enumerator name='ZFS_IOC_EVENTS_CLEAR' value='23170'/>
@@ -6554,9 +6567,11 @@
       <enumerator name='SPA_FEATURE_PHYSICAL_REWRITE' value='46'/>
       <enumerator name='SPA_FEATURE_DRAID_FAIL_DOMAINS' value='47'/>
       <enumerator name='SPA_FEATURE_ANYRAID' value='48'/>
-      <enumerator name='SPA_FEATURES' value='49'/>
+      <enumerator name='SPA_FEATURE_PARITY_RECORDS' value='49'/>
+      <enumerator name='SPA_FEATURES' value='50'/>
     </enum-decl>
     <typedef-decl name='spa_feature_t' type-id='33ecb627' id='d6618c78'/>
+    <pointer-type-def type-id='9b23c9ad' size-in-bits='64' id='c0563f85'/>
     <qualified-type-def type-id='80f4b756' const='yes' id='b99c00c9'/>
     <pointer-type-def type-id='b99c00c9' size-in-bits='64' id='13956559'/>
     <qualified-type-def type-id='22cce67b' const='yes' id='d2816df0'/>
@@ -6822,6 +6837,13 @@
       <parameter type-id='90421557'/>
       <return type-id='95e97e5e'/>
     </function-decl>
+    <function-decl name='nvlist_lookup_string_array' visibility='default' binding='global' size-in-bits='64'>
+      <parameter type-id='5ce45b60'/>
+      <parameter type-id='80f4b756'/>
+      <parameter type-id='c0563f85'/>
+      <parameter type-id='4dd26a40'/>
+      <return type-id='95e97e5e'/>
+    </function-decl>
     <function-decl name='nvpair_value_nvlist' visibility='default' binding='global' size-in-bits='64'>
       <parameter type-id='3fa542f0'/>
       <parameter type-id='857bb57e'/>
@@ -6947,12 +6969,6 @@
     </function-decl>
     <function-decl name='get_system_hostid' mangled-name='get_system_hostid' visibility='default' binding='global' size-in-bits='64' elf-symbol-id='get_system_hostid'>
       <return type-id='7359adad'/>
-    </function-decl>
-    <function-decl name='strtoull' visibility='default' binding='global' size-in-bits='64'>
-      <parameter type-id='9d26089a'/>
-      <parameter type-id='8c85230f'/>
-      <parameter type-id='95e97e5e'/>
-      <return type-id='3a47d82b'/>
     </function-decl>
     <function-decl name='memcmp' visibility='default' binding='global' size-in-bits='64'>
       <parameter type-id='eaa32e2f'/>
@@ -8723,7 +8739,6 @@
     <pointer-type-def type-id='d5027220' size-in-bits='64' id='b7f2d5e6'/>
     <qualified-type-def type-id='26a90f95' const='yes' id='57de658a'/>
     <pointer-type-def type-id='57de658a' size-in-bits='64' id='f319fae0'/>
-    <pointer-type-def type-id='9b23c9ad' size-in-bits='64' id='c0563f85'/>
     <qualified-type-def type-id='33f57a65' const='yes' id='21fd6035'/>
     <pointer-type-def type-id='21fd6035' size-in-bits='64' id='a0de50cd'/>
     <pointer-type-def type-id='a0de50cd' size-in-bits='64' id='24f95ba5'/>
@@ -8864,6 +8879,12 @@
       <parameter type-id='9d26089a'/>
       <parameter type-id='8c85230f'/>
       <return type-id='a0eb0f08'/>
+    </function-decl>
+    <function-decl name='strtoul' visibility='default' binding='global' size-in-bits='64'>
+      <parameter type-id='9d26089a'/>
+      <parameter type-id='8c85230f'/>
+      <parameter type-id='95e97e5e'/>
+      <return type-id='7359adad'/>
     </function-decl>
     <function-decl name='realloc' visibility='default' binding='global' size-in-bits='64'>
       <parameter type-id='eaa32e2f'/>
@@ -9549,6 +9570,7 @@
     <class-decl name='blkid_struct_dev' is-struct='yes' visibility='default' is-declaration-only='yes' id='86223623'/>
     <class-decl name='blkid_struct_dev_iterate' is-struct='yes' visibility='default' is-declaration-only='yes' id='d88420d6'/>
     <class-decl name='udev_list_entry' is-struct='yes' visibility='default' is-declaration-only='yes' id='e7dbdca3'/>
+    <class-decl name='udev_queue' is-struct='yes' visibility='default' is-declaration-only='yes' id='54df860f'/>
     <typedef-decl name='pool_vdev_iter_f' type-id='6c16a6c8' id='dff793e0'/>
     <typedef-decl name='blkid_dev' type-id='8433f053' id='f47b023a'/>
     <typedef-decl name='blkid_cache' type-id='940e3afc' id='0882dfdf'/>
@@ -9561,10 +9583,12 @@
     <pointer-type-def type-id='d88420d6' size-in-bits='64' id='b8fa2efc'/>
     <pointer-type-def type-id='2ec2411e' size-in-bits='64' id='6c16a6c8'/>
     <pointer-type-def type-id='e7dbdca3' size-in-bits='64' id='deabd0d3'/>
+    <pointer-type-def type-id='54df860f' size-in-bits='64' id='839727a7'/>
     <class-decl name='blkid_struct_cache' is-struct='yes' visibility='default' is-declaration-only='yes' id='09286066'/>
     <class-decl name='blkid_struct_dev' is-struct='yes' visibility='default' is-declaration-only='yes' id='86223623'/>
     <class-decl name='blkid_struct_dev_iterate' is-struct='yes' visibility='default' is-declaration-only='yes' id='d88420d6'/>
     <class-decl name='udev_list_entry' is-struct='yes' visibility='default' is-declaration-only='yes' id='e7dbdca3'/>
+    <class-decl name='udev_queue' is-struct='yes' visibility='default' is-declaration-only='yes' id='54df860f'/>
     <function-decl name='for_each_vdev_in_nvlist' visibility='default' binding='global' size-in-bits='64'>
       <parameter type-id='5ce45b60'/>
       <parameter type-id='dff793e0'/>
@@ -9654,6 +9678,18 @@
     <function-decl name='udev_device_get_devlinks_list_entry' visibility='default' binding='global' size-in-bits='64'>
       <parameter type-id='b32bae08'/>
       <return type-id='deabd0d3'/>
+    </function-decl>
+    <function-decl name='udev_queue_unref' visibility='default' binding='global' size-in-bits='64'>
+      <parameter type-id='839727a7'/>
+      <return type-id='839727a7'/>
+    </function-decl>
+    <function-decl name='udev_queue_new' visibility='default' binding='global' size-in-bits='64'>
+      <parameter type-id='025eefe7'/>
+      <return type-id='839727a7'/>
+    </function-decl>
+    <function-decl name='udev_queue_get_udev_is_active' visibility='default' binding='global' size-in-bits='64'>
+      <parameter type-id='839727a7'/>
+      <return type-id='95e97e5e'/>
     </function-decl>
     <function-decl name='sched_yield' visibility='default' binding='global' size-in-bits='64'>
       <return type-id='95e97e5e'/>
@@ -10094,8 +10130,8 @@
     </function-decl>
   </abi-instr>
   <abi-instr address-size='64' path='module/zcommon/zfeature_common.c' language='LANG_C99'>
-    <array-type-def dimensions='1' type-id='83f29ca2' size-in-bits='21952' id='f92b2a1c'>
-      <subrange length='49' type-id='7359adad' id='8b6f62cc'/>
+    <array-type-def dimensions='1' type-id='83f29ca2' size-in-bits='22400' id='69d3c35e'>
+      <subrange length='50' type-id='7359adad' id='3c1860ce'/>
     </array-type-def>
     <enum-decl name='zfeature_flags' id='6db816a4'>
       <underlying-type type-id='9cac1fee'/>
@@ -10156,7 +10192,7 @@
     <pointer-type-def type-id='c5c76c9c' size-in-bits='64' id='b7f9d8e6'/>
     <qualified-type-def type-id='eaa32e2f' const='yes' id='83be723c'/>
     <pointer-type-def type-id='83be723c' size-in-bits='64' id='7acd98a2'/>
-    <var-decl name='spa_feature_table' type-id='f92b2a1c' mangled-name='spa_feature_table' visibility='default' elf-symbol-id='spa_feature_table'/>
+    <var-decl name='spa_feature_table' type-id='69d3c35e' mangled-name='spa_feature_table' visibility='default' elf-symbol-id='spa_feature_table'/>
     <var-decl name='zfeature_checks_disable' type-id='c19b74c3' mangled-name='zfeature_checks_disable' visibility='default' elf-symbol-id='zfeature_checks_disable'/>
     <function-decl name='tsearch' visibility='default' binding='global' size-in-bits='64'>
       <parameter type-id='eaa32e2f'/>
@@ -10263,29 +10299,30 @@
       <enumerator name='ZFS_DELEG_NOTE_SEND_RAW' value='8'/>
       <enumerator name='ZFS_DELEG_NOTE_SEND_ENCRYPTED' value='9'/>
       <enumerator name='ZFS_DELEG_NOTE_RECEIVE' value='10'/>
-      <enumerator name='ZFS_DELEG_NOTE_ALLOW' value='11'/>
-      <enumerator name='ZFS_DELEG_NOTE_USERPROP' value='12'/>
-      <enumerator name='ZFS_DELEG_NOTE_MOUNT' value='13'/>
-      <enumerator name='ZFS_DELEG_NOTE_SHARE' value='14'/>
-      <enumerator name='ZFS_DELEG_NOTE_USERQUOTA' value='15'/>
-      <enumerator name='ZFS_DELEG_NOTE_GROUPQUOTA' value='16'/>
-      <enumerator name='ZFS_DELEG_NOTE_USERUSED' value='17'/>
-      <enumerator name='ZFS_DELEG_NOTE_GROUPUSED' value='18'/>
-      <enumerator name='ZFS_DELEG_NOTE_USEROBJQUOTA' value='19'/>
-      <enumerator name='ZFS_DELEG_NOTE_GROUPOBJQUOTA' value='20'/>
-      <enumerator name='ZFS_DELEG_NOTE_USEROBJUSED' value='21'/>
-      <enumerator name='ZFS_DELEG_NOTE_GROUPOBJUSED' value='22'/>
-      <enumerator name='ZFS_DELEG_NOTE_HOLD' value='23'/>
-      <enumerator name='ZFS_DELEG_NOTE_RELEASE' value='24'/>
-      <enumerator name='ZFS_DELEG_NOTE_DIFF' value='25'/>
-      <enumerator name='ZFS_DELEG_NOTE_BOOKMARK' value='26'/>
-      <enumerator name='ZFS_DELEG_NOTE_LOAD_KEY' value='27'/>
-      <enumerator name='ZFS_DELEG_NOTE_CHANGE_KEY' value='28'/>
-      <enumerator name='ZFS_DELEG_NOTE_PROJECTUSED' value='29'/>
-      <enumerator name='ZFS_DELEG_NOTE_PROJECTQUOTA' value='30'/>
-      <enumerator name='ZFS_DELEG_NOTE_PROJECTOBJUSED' value='31'/>
-      <enumerator name='ZFS_DELEG_NOTE_PROJECTOBJQUOTA' value='32'/>
-      <enumerator name='ZFS_DELEG_NOTE_NONE' value='33'/>
+      <enumerator name='ZFS_DELEG_NOTE_RECEIVE_APPEND' value='11'/>
+      <enumerator name='ZFS_DELEG_NOTE_ALLOW' value='12'/>
+      <enumerator name='ZFS_DELEG_NOTE_USERPROP' value='13'/>
+      <enumerator name='ZFS_DELEG_NOTE_MOUNT' value='14'/>
+      <enumerator name='ZFS_DELEG_NOTE_SHARE' value='15'/>
+      <enumerator name='ZFS_DELEG_NOTE_USERQUOTA' value='16'/>
+      <enumerator name='ZFS_DELEG_NOTE_GROUPQUOTA' value='17'/>
+      <enumerator name='ZFS_DELEG_NOTE_USERUSED' value='18'/>
+      <enumerator name='ZFS_DELEG_NOTE_GROUPUSED' value='19'/>
+      <enumerator name='ZFS_DELEG_NOTE_USEROBJQUOTA' value='20'/>
+      <enumerator name='ZFS_DELEG_NOTE_GROUPOBJQUOTA' value='21'/>
+      <enumerator name='ZFS_DELEG_NOTE_USEROBJUSED' value='22'/>
+      <enumerator name='ZFS_DELEG_NOTE_GROUPOBJUSED' value='23'/>
+      <enumerator name='ZFS_DELEG_NOTE_HOLD' value='24'/>
+      <enumerator name='ZFS_DELEG_NOTE_RELEASE' value='25'/>
+      <enumerator name='ZFS_DELEG_NOTE_DIFF' value='26'/>
+      <enumerator name='ZFS_DELEG_NOTE_BOOKMARK' value='27'/>
+      <enumerator name='ZFS_DELEG_NOTE_LOAD_KEY' value='28'/>
+      <enumerator name='ZFS_DELEG_NOTE_CHANGE_KEY' value='29'/>
+      <enumerator name='ZFS_DELEG_NOTE_PROJECTUSED' value='30'/>
+      <enumerator name='ZFS_DELEG_NOTE_PROJECTQUOTA' value='31'/>
+      <enumerator name='ZFS_DELEG_NOTE_PROJECTOBJUSED' value='32'/>
+      <enumerator name='ZFS_DELEG_NOTE_PROJECTOBJQUOTA' value='33'/>
+      <enumerator name='ZFS_DELEG_NOTE_NONE' value='34'/>
     </enum-decl>
     <typedef-decl name='zfs_deleg_note_t' type-id='729d4547' id='4613c173'/>
     <class-decl name='zfs_deleg_perm_tab' size-in-bits='128' is-struct='yes' visibility='default' id='5aa05c1f'>

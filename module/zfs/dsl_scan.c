@@ -37,6 +37,7 @@
 #include <sys/fs/zfs.h>
 #include <sys/zfs_znode.h>
 #include <sys/spa_impl.h>
+#include <sys/spa_lag.h>
 #include <sys/vdev_impl.h>
 #include <sys/zil_impl.h>
 #include <sys/zio_checksum.h>
@@ -3716,6 +3717,14 @@ dsl_scan_async_block_should_pause(dsl_scan_t *scn)
 	if (zfs_recover)
 		return (B_FALSE);
 
+	/*
+	 * A lagging consumer (the parity set) keeps a record of each free and
+	 * returns no space until the outside has applied it.  Stop for this txg
+	 * when its records or held frees near their limits, and go on later.
+	 */
+	if (spa_lag_free_pause(scn->scn_dp->dp_spa))
+		return (B_TRUE);
+
 	if (zfs_async_block_max_blocks != 0 &&
 	    scn->scn_visited_this_txg >= zfs_async_block_max_blocks) {
 		return (B_TRUE);
@@ -3873,8 +3882,16 @@ dsl_scan_active(dsl_scan_t *scn)
 		return (B_FALSE);
 	if (spa_shutting_down(spa))
 		return (B_FALSE);
-	if ((dsl_scan_is_running(scn) && !dsl_scan_is_paused_scrub(scn)) ||
-	    (scn->scn_async_destroying && !scn->scn_async_stalled))
+	if (dsl_scan_is_running(scn) && !dsl_scan_is_paused_scrub(scn))
+		return (B_TRUE);
+	/*
+	 * Frees paused by a lagging consumer (the parity set) do no work until
+	 * the consumer applies records: do not drive txgs for them, or an idle
+	 * pool syncs back to back and its disks never spin down.
+	 */
+	if (spa_lag_free_pause(spa))
+		return (B_FALSE);
+	if (scn->scn_async_destroying && !scn->scn_async_stalled)
 		return (B_TRUE);
 
 	if (spa_version(scn->scn_dp->dp_spa) >= SPA_VERSION_DEADLISTS) {

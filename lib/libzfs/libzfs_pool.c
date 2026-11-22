@@ -4171,6 +4171,17 @@ zpool_vdev_attach(zpool_handle_t *zhp, const char *old_disk,
 		    "this raidz vdev is too wide to be expanded");
 		(void) zfs_error(hdl, EZFS_BADTARGET, errbuf);
 		break;
+	case ZFS_ERR_PARITY_ACTIVE:
+		zfs_error_aux(hdl,
+		    "the pool is in a parity set (parityset is on, or its "
+		    "records are not yet applied)");
+		(void) zfs_error(hdl, EZFS_BUSY, errbuf);
+		break;
+	case ZFS_ERR_PARITY_TOO_LARGE:
+		zfs_error_aux(hdl, "the new vdev is larger than the parity set "
+		    "covers (the largest data vdev, or parity_grow_max)");
+		(void) zfs_error(hdl, EZFS_BADDEV, errbuf);
+		break;
 	default:
 		(void) zpool_standard_error(hdl, errno, errbuf);
 	}

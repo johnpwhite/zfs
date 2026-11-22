@@ -85,6 +85,12 @@ void metaslab_unalloc_dva(spa_t *, const dva_t *, uint64_t);
 int metaslab_claim(spa_t *, const blkptr_t *, uint64_t);
 int metaslab_claim_impl(vdev_t *, uint64_t, uint64_t, uint64_t);
 void metaslab_check_free(spa_t *, const blkptr_t *);
+void metaslab_free_held(spa_t *, const blkptr_t *);
+boolean_t metaslab_range_freed(spa_t *, uint64_t, uint64_t, uint64_t);
+boolean_t metaslab_range_freeing(spa_t *, uint64_t, uint64_t, uint64_t);
+int metaslab_range_allocated(spa_t *, uint64_t, uint64_t, uint64_t);
+void metaslab_free_range(spa_t *, uint64_t, uint64_t, uint64_t);
+int metaslab_allocated_ranges(metaslab_t *, zfs_range_tree_t *);
 
 void metaslab_stat_init(void);
 void metaslab_stat_fini(void);

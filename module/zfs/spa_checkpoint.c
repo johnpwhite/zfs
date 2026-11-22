@@ -135,6 +135,7 @@
 #include <sys/spa.h>
 #include <sys/spa_impl.h>
 #include <sys/spa_checkpoint.h>
+#include <sys/spa_parity_impl.h>
 #include <sys/vdev_impl.h>
 #include <sys/zap.h>
 #include <sys/zfeature.h>
@@ -447,6 +448,9 @@ spa_checkpoint_check(void *arg, dmu_tx_t *tx)
 {
 	(void) arg;
 	spa_t *spa = dmu_tx_pool(tx)->dp_spa;
+
+	if (spa_parity_busy(spa))
+		return (SET_ERROR(ZFS_ERR_PARITY_ACTIVE));
 
 	if (!spa_feature_is_enabled(spa, SPA_FEATURE_POOL_CHECKPOINT))
 		return (SET_ERROR(ENOTSUP));

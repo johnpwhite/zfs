@@ -42,6 +42,7 @@ enum scope_prefix_types {
 	zfs_metaslab,
 	zfs_mg,
 	zfs_multihost,
+	zfs_parity,
 	zfs_prefetch,
 	zfs_reconstruct,
 	zfs_recv,

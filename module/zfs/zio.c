@@ -27,6 +27,8 @@
 #include <sys/spa.h>
 #include <sys/txg.h>
 #include <sys/spa_impl.h>
+#include <sys/spa_lag.h>
+#include <sys/spa_parity.h>
 #include <sys/vdev_impl.h>
 #include <sys/vdev_raidz.h>
 #include <sys/vdev_trim.h>
@@ -963,6 +965,7 @@ zio_create(zio_t *pio, spa_t *spa, uint64_t txg, const blkptr_t *bp,
     enum zio_stage pipeline)
 {
 	zio_t *zio;
+	dsl_pool_t *dp;
 
 	IMPLY(type != ZIO_TYPE_TRIM, psize <= SPA_MAXBLOCKSIZE);
 	ASSERT0(P2PHASE(psize, SPA_MINBLOCKSIZE));
@@ -973,6 +976,20 @@ zio_create(zio_t *pio, spa_t *spa, uint64_t txg, const blkptr_t *bp,
 	ASSERT(vd || stage == ZIO_STAGE_OPEN);
 
 	IMPLY(lsize != psize, (flags & ZIO_FLAG_RAW_COMPRESS) != 0);
+
+	/*
+	 * Keep the txg-sync context on every child of its I/O tree.  Only a
+	 * parity set member reads the flag (its repair never waits in the
+	 * txg sync), so other pools make no extra test here.
+	 */
+	if (pio != NULL && (pio->io_flags & ZIO_FLAG_TXG_SYNC))
+		flags |= ZIO_FLAG_TXG_SYNC;
+	else if (spa->spa_parity != NULL) {
+		dp = spa_get_dsl(spa);
+
+		if (dp != NULL && dsl_pool_sync_context(dp))
+			flags |= ZIO_FLAG_TXG_SYNC;
+	}
 
 	zio = kmem_cache_alloc(zio_cache, KM_SLEEP);
 	memset(zio, 0, sizeof (zio_t));
@@ -5936,6 +5953,19 @@ zio_ready(zio_t *zio)
 		zio->io_ready(zio);
 	}
 
+	/*
+	 * The BP is now final (fill, checksum, dedup and rewrite bits).
+	 * Refresh the copy that a lagging consumer took at allocation.  The
+	 * ZIL refreshes its own blocks in zil.c when their BP is final (the
+	 * lwb write is a rewrite with txg 0, so it would not match here).
+	 */
+	if (zio->io_type == ZIO_TYPE_WRITE && zio->io_error == 0 &&
+	    zio->io_spa->spa_lag[0] != NULL &&
+	    bp != NULL && !BP_IS_HOLE(bp) && !BP_IS_EMBEDDED(bp) &&
+	    BP_GET_TYPE(bp) != DMU_OT_INTENT_LOG &&
+	    BP_GET_BIRTH(bp) == zio->io_txg)
+		spa_lag_write_ready(zio->io_spa, bp, zio->io_txg);
+
 #ifdef ZFS_DEBUG
 	if (bp != NULL && bp != &zio->io_bp_copy)
 		zio->io_bp_copy = *bp;
@@ -6145,6 +6175,20 @@ zio_done(zio_t *zio)
 		}
 	}
 
+	/*
+	 * A parity provider can replace failed on-disk bytes before the read
+	 * transforms are popped.  The read then uses the normal checksum,
+	 * decryption and decompression path.
+	 */
+	if (zio->io_error != 0 && zio->io_type == ZIO_TYPE_READ &&
+	    zio->io_bp != NULL && zio->io_spa->spa_parity != NULL) {
+		uint64_t request = spa_parity_repair_note(zio->io_spa, zio);
+
+		if (request != 0 &&
+		    spa_parity_repair_wait(zio->io_spa, zio, request))
+			zio->io_error = 0;
+	}
+
 	zio_pop_transforms(zio);	/* note: may set zio->io_error */
 
 	/*
@@ -6246,6 +6290,7 @@ zio_done(zio_t *zio)
 			(void) zfs_ereport_post(FM_EREPORT_ZFS_DATA,
 			    zio->io_spa, NULL, &zio->io_bookmark, zio, 0);
 		}
+
 	}
 
 	if (zio->io_error && zio == zio->io_logical) {

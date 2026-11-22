@@ -157,6 +157,61 @@ _LIBZFS_CORE_H int lzc_scrub(zfs_ioc_t, const char *, nvlist_t *, nvlist_t **);
 _LIBZFS_CORE_H int lzc_ddt_prune(const char *, zpool_ddt_prune_unit_t,
     uint64_t);
 
+/* Parity set. */
+_LIBZFS_CORE_H int lzc_parity_info(const char *, nvlist_t **);
+_LIBZFS_CORE_H int lzc_parity_info_txg(const char *, const uint64_t *,
+    nvlist_t **);
+_LIBZFS_CORE_H int lzc_parity_records(const char *, uint64_t, uint64_t,
+    uint64_t, nvlist_t **);
+_LIBZFS_CORE_H int lzc_parity_read(const char *, const uint64_t [18],
+    nvlist_t **);
+_LIBZFS_CORE_H int lzc_parity_read_index(const char *, const uint64_t [18],
+    const uint64_t *, nvlist_t **);
+_LIBZFS_CORE_H int lzc_parity_readv(const char *, const uint64_t *, size_t,
+    const uint64_t *, nvlist_t **);
+_LIBZFS_CORE_H int lzc_parity_verify(const char *, const uint64_t [18],
+    const void *, size_t, boolean_t *);
+_LIBZFS_CORE_H int lzc_parity_verify_index(const char *, const uint64_t [18],
+    const uint64_t *, const void *, size_t, boolean_t *);
+_LIBZFS_CORE_H int lzc_parity_verify_index_ex(const char *,
+    const uint64_t [18], const uint64_t *, const void *, size_t, boolean_t *,
+    boolean_t *);
+_LIBZFS_CORE_H int lzc_parity_map(const char *, uint64_t, uint64_t, uint64_t,
+    nvlist_t **);
+_LIBZFS_CORE_H int lzc_parity_blocks(const char *, uint64_t, uint64_t,
+    uint64_t, nvlist_t **);
+_LIBZFS_CORE_H int lzc_parity_blocks_windows(const char *, uint64_t,
+    const uint64_t *, uint_t, const uint64_t [PARITY_BLOCKS_RESUME_WORDS],
+    uint64_t, nvlist_t **);
+_LIBZFS_CORE_H int lzc_parity_current(const char *, uint64_t, nvlist_t **);
+_LIBZFS_CORE_H int lzc_parity_label(const char *, uint64_t, nvlist_t **);
+/* the call for one data column; LZC_PARITY_VDEV_FIRST = the first */
+#define	LZC_PARITY_VDEV_FIRST	UINT64_MAX
+_LIBZFS_CORE_H int lzc_parity_map_vdev(const char *, uint64_t, uint64_t,
+    uint64_t, uint64_t, nvlist_t **);
+_LIBZFS_CORE_H int lzc_parity_blocks_vdev(const char *, uint64_t, uint64_t,
+    uint64_t, uint64_t, nvlist_t **);
+_LIBZFS_CORE_H int lzc_parity_blocks_windows_vdev(const char *, uint64_t,
+    uint64_t, const uint64_t *, uint_t,
+    const uint64_t [PARITY_BLOCKS_RESUME_WORDS], uint64_t, nvlist_t **);
+_LIBZFS_CORE_H int lzc_parity_current_vdev(const char *, uint64_t, uint64_t,
+    nvlist_t **);
+_LIBZFS_CORE_H int lzc_parity_label_vdev(const char *, uint64_t, uint64_t,
+    nvlist_t **);
+_LIBZFS_CORE_H int lzc_parity_applied(const char *, uint64_t, uint64_t);
+_LIBZFS_CORE_H int lzc_parity_applied_set(const char *, uint64_t, uint64_t,
+	uint64_t);
+_LIBZFS_CORE_H int lzc_parity_repair(const char *, uint64_t, const void *,
+    size_t, boolean_t *);
+_LIBZFS_CORE_H int lzc_parity_provider_register(uint64_t);
+_LIBZFS_CORE_H int lzc_parity_repair_supply(uint64_t, uint64_t,
+    const void *, size_t);
+_LIBZFS_CORE_H int lzc_parity_repair_decline(uint64_t, uint64_t);
+_LIBZFS_CORE_H int lzc_parity_drop(const char *, uint64_t);
+_LIBZFS_CORE_H int lzc_parity_drop_set(const char *, uint64_t, uint64_t);
+_LIBZFS_CORE_H int lzc_parity_reclaim(const char *, uint64_t pool_guid,
+	uint64_t txg, uint64_t flags, const uint64_t *, uint_t, nvlist_t **);
+
 #ifdef	__cplusplus
 }
 #endif

@@ -877,6 +877,61 @@ when the
 command is used on a top-level vdev, and will never return to being
 .Sy enabled .
 .
+.feature org.openzfs parity_records yes
+This feature enables the
+.Sy parityset
+pool property.
+A pool with
+.Sy parityset Ns = Ns Sy on
+is one member of a parity set:
+a group of independent single-disk pools that share lagging parity disks.
+While the pool is a member, ZFS keeps a list of the blocks that it allocates
+and frees.
+It holds each freed block, so that the block is not reused until
+the parity software has applied the change to the parity disks.
+The pool remains an ordinary single-disk pool, and it can be imported alone on
+any host.
+.Pp
+This feature becomes
+.Sy active
+when ZFS writes the first record, that is, a few transactions after
+.Sy parityset
+is set to
+.Sy on .
+The feature is
+.Sy active
+while the pool is a member of a parity set: while
+.Sy parityset
+is
+.Sy on ,
+or while some records are not yet applied or some freed blocks are still held.
+A member is thus never writable by software that does not know the records.
+It returns to
+.Sy enabled
+when all records are released and
+.Sy parityset
+is
+.Sy off ,
+or after
+.Nm zpool Cm parity Cm drop .
+.Pp
+Because the feature is read-only compatible, software that does not support it
+can import a pool where it is
+.Sy active
+in read-only mode only.
+This import does not change any record or any held block.
+While the feature is
+.Sy active ,
+.Nm zpool Cm checkpoint ,
+.Nm zpool Cm reguid ,
+.Nm zpool Cm add ,
+.Nm zpool Cm attach
+and online expansion are refused.
+See
+.Xr zpool-parity 8
+and
+.Xr zpoolprops 7 .
+.
 .feature com.truenas physical_rewrite yes extensible_dataset
 This feature enables physical block rewriting that preserves logical birth
 times, avoiding unnecessary inclusion of rewritten blocks in incremental

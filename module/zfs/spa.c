@@ -41,6 +41,7 @@
 #include <sys/zfs_context.h>
 #include <sys/fm/fs/zfs.h>
 #include <sys/spa_impl.h>
+#include <sys/spa_parity_impl.h>
 #include <sys/zio.h>
 #include <sys/zio_checksum.h>
 #include <sys/dmu.h>
@@ -810,6 +811,62 @@ spa_prop_validate(spa_t *spa, nvlist_t *props)
 				error = SET_ERROR(EINVAL);
 			break;
 
+		case ZPOOL_PROP_PARITYSET:
+			error = nvpair_value_uint64(elem, &intval);
+			if (!error && intval > 1)
+				error = SET_ERROR(EINVAL);
+			/*
+			 * At pool creation the feature and the vdev tree do not
+			 * exist yet; spa_create() checks them.  Turning it off
+			 * is always allowed.
+			 */
+			if (!error && intval == 1 && spa->spa_sync_on) {
+				if (!spa_feature_is_enabled(spa,
+				    SPA_FEATURE_PARITY_RECORDS))
+					error = SET_ERROR(ENOTSUP);
+				else if (!spa_writeable(spa))
+					error = SET_ERROR(EROFS);
+				else if (spa_has_checkpoint(spa))
+					error = SET_ERROR(
+					    ZFS_ERR_CHECKPOINT_EXISTS);
+				else if (spa_feature_is_active(spa,
+				    SPA_FEATURE_POOL_CHECKPOINT))
+					error = SET_ERROR(
+					    ZFS_ERR_DISCARDING_CHECKPOINT);
+				else
+					error = spa_parity_eligible(spa);
+				/*
+				 * A dataset with checksum=off or noparity
+				 * refuses it (a walk in open context).
+				 */
+				if (error == 0)
+					error = spa_parity_check_checksums(spa);
+			}
+			break;
+
+		case ZPOOL_PROP_PARITY_ONSTALL:
+			error = nvpair_value_uint64(elem, &intval);
+			if (!error && intval > ZPOOL_PARITY_ONSTALL_WAIT)
+				error = SET_ERROR(EINVAL);
+			break;
+
+		case ZPOOL_PROP_PARITY_PACE:
+			error = nvpair_value_uint64(elem, &intval);
+			if (!error && intval > 1)
+				error = SET_ERROR(EINVAL);
+			break;
+
+		case ZPOOL_PROP_PARITY_MAX_RECORDS:
+		case ZPOOL_PROP_PARITY_GROW_MAX:
+			error = nvpair_value_uint64(elem, &intval);
+			break;
+
+		case ZPOOL_PROP_PARITY_MAX_HELD:
+			error = nvpair_value_uint64(elem, &intval);
+			if (!error && intval > 100)
+				error = SET_ERROR(EINVAL);
+			break;
+
 		case ZPOOL_PROP_MULTIHOST:
 			error = nvpair_value_uint64(elem, &intval);
 			if (!error && intval > 1)
@@ -1063,6 +1120,9 @@ spa_change_guid_check(void *arg, dmu_tx_t *tx)
 	spa_t *spa = dmu_tx_pool(tx)->dp_spa;
 	vdev_t *rvd = spa->spa_root_vdev;
 	uint64_t vdev_state;
+
+	if (spa_parity_busy(spa))
+		return (SET_ERROR(ZFS_ERR_PARITY_ACTIVE));
 
 	if (spa_feature_is_active(spa, SPA_FEATURE_POOL_CHECKPOINT)) {
 		int error = (spa_has_checkpoint(spa)) ?
@@ -1866,7 +1926,7 @@ spa_activate(spa_t *spa, spa_mode_t mode)
 
 	for (size_t i = 0; i < TXG_SIZE; i++) {
 		spa->spa_txg_zio[i] = zio_root(spa, NULL, NULL,
-		    ZIO_FLAG_CANFAIL);
+		    ZIO_FLAG_CANFAIL | ZIO_FLAG_TXG_SYNC);
 	}
 
 	list_create(&spa->spa_config_dirty_list, sizeof (vdev_t),
@@ -2406,6 +2466,8 @@ spa_unload(spa_t *spa)
 		kmem_free(spa->spa_async_zio_root, max_ncpus * sizeof (void *));
 		spa->spa_async_zio_root = NULL;
 	}
+
+	spa_parity_unload(spa);
 
 	if (spa->spa_vdev_removal != NULL) {
 		spa_vdev_removal_destroy(spa->spa_vdev_removal);
@@ -5590,6 +5652,9 @@ spa_ld_get_props(spa_t *spa)
 	nvlist_free(mos_config);
 
 	spa->spa_delegation = zpool_prop_default_numeric(ZPOOL_PROP_DELEGATION);
+	/* Not 0: a pool that never set it must still pace. */
+	spa->spa_parity_pace =
+	    zpool_prop_default_numeric(ZPOOL_PROP_PARITY_PACE);
 
 	error = spa_dir_prop(spa, DMU_POOL_PROPS, &spa->spa_pool_props_object,
 	    B_FALSE);
@@ -5608,6 +5673,16 @@ spa_ld_get_props(spa_t *spa)
 		    &spa->spa_dedup_table_quota);
 		spa_prop_find(spa, ZPOOL_PROP_MULTIHOST, &spa->spa_multihost);
 		spa_prop_find(spa, ZPOOL_PROP_AUTOTRIM, &spa->spa_autotrim);
+		spa_prop_find(spa, ZPOOL_PROP_PARITY_ONSTALL,
+		    &spa->spa_parity_onstall);
+		spa_prop_find(spa, ZPOOL_PROP_PARITY_PACE,
+		    &spa->spa_parity_pace);
+		spa_prop_find(spa, ZPOOL_PROP_PARITY_MAX_RECORDS,
+		    &spa->spa_parity_max_records);
+		spa_prop_find(spa, ZPOOL_PROP_PARITY_MAX_HELD,
+		    &spa->spa_parity_max_held);
+		spa_prop_find(spa, ZPOOL_PROP_PARITY_GROW_MAX,
+		    &spa->spa_parity_grow_max);
 		spa->spa_autoreplace = (autoreplace != 0);
 	}
 
@@ -6373,6 +6448,19 @@ spa_load_impl(spa_t *spa, spa_import_type_t type, const char **ereport)
 			    (u_longlong_t)spa->spa_uberblock.ub_checkpoint_txg);
 		}
 
+		/*
+		 * A pool with parityset=on records the claimed blocks too, so
+		 * the capture must be armed before the claim txg is written.  A
+		 * pool whose records cannot be read must not import read-write:
+		 * its held frees would be lost.
+		 */
+		error = spa_ld_parity_load(spa);
+		if (error != 0) {
+			spa_load_failed(spa, "spa_ld_parity_load failed "
+			    "[error=%d]", error);
+			goto fail;
+		}
+
 		spa_import_progress_set_notes(spa, "Claiming ZIL blocks");
 		/*
 		 * Traverse the ZIL and claim all blocks.
@@ -6477,6 +6565,14 @@ spa_load_impl(spa_t *spa, spa_import_type_t type, const char **ereport)
 		vdev_autotrim_restart(spa);
 		spa_config_exit(spa, SCL_CONFIG, FTAG);
 		spa_import_progress_set_notes(spa, "Finished importing");
+	} else if (!spa_writeable(spa) &&
+	    spa->spa_load_state != SPA_LOAD_TRYIMPORT) {
+		/*
+		 * A read-only import of a parity set member loads its records
+		 * for INFO, RECORDS, READ, MAP and LABEL, and arms nothing.
+		 * It never fails the import.
+		 */
+		(void) spa_ld_parity_load(spa);
 	}
 	zio_handle_import_delay(spa, gethrtime() - load_start);
 
@@ -6497,11 +6593,27 @@ static int
 spa_load_retry(spa_t *spa, spa_load_state_t state)
 {
 	spa_mode_t mode = spa->spa_mode;
+	/*
+	 * The first attempt may have failed before spa_ld_parity_load() made
+	 * spa_parity, so ask the disk as well (#K1).
+	 */
+	boolean_t parity = spa_parity_busy(spa) ||
+	    spa_parity_member_on_disk(spa);
 
 	spa_unload(spa);
 	spa_deactivate(spa);
 
 	spa->spa_load_max_txg = spa->spa_uberblock.ub_txg - 1;
+
+	/*
+	 * A pool with parity records must not grow a vdev in a retry that
+	 * rewinds: the records describe the old size, and growth after import
+	 * goes through zpool online -e, which such a pool refuses while it
+	 * holds records.  Open the vdevs as the first attempt did, before the
+	 * properties are read.  Other pools are not changed.
+	 */
+	if (parity)
+		spa->spa_autoexpand = 0;
 
 	spa_activate(spa, mode);
 	spa_async_suspend(spa);
@@ -7315,6 +7427,7 @@ spa_create(const char *pool, nvlist_t *nvroot, nvlist_t *props,
 	uint_t nspares, nl2cache;
 	uint64_t version, obj, ndraid = 0, draid_nfgroup = 0;
 	boolean_t has_features;
+	boolean_t has_parity;
 	boolean_t has_encryption;
 	boolean_t has_allocclass;
 	boolean_t has_draid;
@@ -7364,6 +7477,7 @@ spa_create(const char *pool, nvlist_t *nvroot, nvlist_t *props,
 		spa->spa_import_flags |= ZFS_IMPORT_TEMP_NAME;
 
 	has_features = B_FALSE;
+	has_parity = B_FALSE;
 	has_encryption = B_FALSE;
 	has_allocclass = B_FALSE;
 	has_draid = B_FALSE;
@@ -7386,6 +7500,8 @@ spa_create(const char *pool, nvlist_t *nvroot, nvlist_t *props,
 				has_draid_fdomains = B_TRUE;
 			if (feat == SPA_FEATURE_ANYRAID)
 				has_anyraid = B_TRUE;
+			if (feat == SPA_FEATURE_PARITY_RECORDS)
+				has_parity = B_TRUE;
 		}
 	}
 
@@ -7447,6 +7563,18 @@ spa_create(const char *pool, nvlist_t *nvroot, nvlist_t *props,
 
 	if (error == 0 && !zfs_allocatable_devs(nvroot))
 		error = SET_ERROR(EINVAL);
+
+	/* parityset=on at creation: the vdev tree must be one data disk. */
+	if (error == 0 && props != NULL) {
+		uint64_t parity_on = 0;
+
+		(void) nvlist_lookup_uint64(props,
+		    zpool_prop_to_name(ZPOOL_PROP_PARITYSET), &parity_on);
+		if (parity_on != 0 && !has_parity)
+			error = SET_ERROR(ENOTSUP);
+		else if (parity_on != 0)
+			error = spa_parity_eligible_root(rvd);
+	}
 
 	if (error == 0 &&
 	    (error = vdev_create(rvd, txg, B_FALSE)) == 0 &&
@@ -7600,6 +7728,8 @@ spa_create(const char *pool, nvlist_t *nvroot, nvlist_t *props,
 	spa->spa_autoexpand = zpool_prop_default_numeric(ZPOOL_PROP_AUTOEXPAND);
 	spa->spa_multihost = zpool_prop_default_numeric(ZPOOL_PROP_MULTIHOST);
 	spa->spa_autotrim = zpool_prop_default_numeric(ZPOOL_PROP_AUTOTRIM);
+	spa->spa_parity_pace =
+	    zpool_prop_default_numeric(ZPOOL_PROP_PARITY_PACE);
 	spa->spa_dedup_table_quota =
 	    zpool_prop_default_numeric(ZPOOL_PROP_DEDUP_TABLE_QUOTA);
 
@@ -7656,6 +7786,7 @@ spa_import(char *pool, nvlist_t *config, nvlist_t *props, uint64_t flags)
 	zpool_load_policy_t policy;
 	spa_mode_t mode = spa_mode_global;
 	uint64_t readonly = B_FALSE;
+	uint64_t parity_on = 0;
 	int error;
 	nvlist_t *nvroot;
 	nvlist_t **spares, **l2cache;
@@ -7681,6 +7812,16 @@ spa_import(char *pool, nvlist_t *config, nvlist_t *props, uint64_t flags)
 		mode = SPA_MODE_READ;
 	spa = spa_add(pool, config, altroot);
 	spa->spa_import_flags = flags;
+
+	/*
+	 * Import with parityset=on (a rebuilt pool of a parity set): the
+	 * property is applied after the load, which is too late, because the
+	 * ZIL claim txg has already synced by then.  Tell the load instead, so
+	 * that it arms the records and holds before the first write.
+	 */
+	(void) nvlist_lookup_uint64(props,
+	    zpool_prop_to_name(ZPOOL_PROP_PARITYSET), &parity_on);
+	spa->spa_parity_import_on = (parity_on != 0);
 
 	/*
 	 * Verbatim import - Take a pool and insert it into the namespace
@@ -8293,9 +8434,47 @@ spa_vdev_add(spa_t *spa, nvlist_t *nvroot, boolean_t check_ashift)
 	if (vd->vdev_children == 0 && nspares == 0 && nl2cache == 0)
 		return (spa_vdev_exit(spa, vd, txg, EINVAL));
 
+	/*
+	 * A parity set member takes log, cache and spare devices, and
+	 * data vdevs that are single disks or mirrors of single disks: each
+	 * joins the set as a new data column.  raidz, draid, special and
+	 * dedup vdevs are refused, and so is a pool that would get more than
+	 * SPA_PARITY_MAX_COLS data columns.
+	 */
+	if (spa_parity_busy(spa)) {
+		uint64_t ncols = spa_parity_ncols(spa);
+
+		for (int c = 0; c < vd->vdev_children; c++) {
+			if (vd->vdev_child[c]->vdev_islog)
+				continue;
+			if (!spa_parity_column_ok(vd->vdev_child[c]) ||
+			    ++ncols > SPA_PARITY_MAX_COLS) {
+				return (spa_vdev_exit(spa, vd, txg,
+				    ZFS_ERR_PARITY_ACTIVE));
+			}
+		}
+	}
+
 	if (vd->vdev_children != 0 &&
 	    (error = vdev_create(vd, txg, B_FALSE)) != 0) {
 		return (spa_vdev_exit(spa, vd, txg, error));
+	}
+
+	/*
+	 * A new data vdev of a busy member must fit the parity set.
+	 * Its asize is known only now, after vdev_create opened it.
+	 */
+	if (spa_parity_busy(spa)) {
+		uint64_t cap = spa_parity_add_cap(spa);
+
+		for (int c = 0; c < vd->vdev_children; c++) {
+			if (vd->vdev_child[c]->vdev_islog)
+				continue;
+			if (vd->vdev_child[c]->vdev_asize > cap) {
+				return (spa_vdev_exit(spa, vd, txg,
+				    ZFS_ERR_PARITY_TOO_LARGE));
+			}
+		}
 	}
 
 	/*
@@ -8580,6 +8759,38 @@ spa_vdev_attach(spa_t *spa, uint64_t guid, nvlist_t *nvroot, int replacing,
 		return (spa_vdev_exit(spa, NULL, txg, error));
 	}
 
+	/*
+	 * On a parity set member an attach (a disk becomes a mirror, or
+	 * a mirror gets a side) is allowed: the data column stays the same.
+	 * It resilvers as usual; a resilvered side may hold stale bytes at
+	 * held frees, so the service that applies the records reads a mirror
+	 * column side by side and checks each block against its checksum.  A
+	 * replace stays a sequential rebuild (below).
+	 */
+
+	/*
+	 * On a parity set member every replace, and every hot spare
+	 * activation (it comes through here too), is a sequential rebuild.
+	 * Parity works on raw bytes: the new disk must hold every range that
+	 * the space maps call allocated.  A healing resilver copies only the
+	 * live blocks.  It misses the held frees, and the blocks that wait
+	 * to be freed in dp_free_bpobj, the bptree and the deferred frees:
+	 * those are allocated in the space maps but no live tree refers to
+	 * them.  A sequential rebuild copies every allocated range, and the
+	 * automatic scrub after it verifies the live blocks.  If the rebuild
+	 * cannot run (feature off, or a vdev type that it does not support,
+	 * checked below), the attach fails: it never falls back to a
+	 * resilver.
+	 */
+	if (replacing && spa_parity_busy(spa)) {
+		if (!spa_feature_is_enabled(spa, SPA_FEATURE_DEVICE_REBUILD))
+			return (spa_vdev_exit(spa, NULL, txg,
+			    ZFS_ERR_PARITY_ACTIVE));
+		rebuild = B_TRUE;
+		zfs_dbgmsg("parity: pool '%s': replace of vdev %llu is a "
+		    "sequential rebuild", spa_name(spa), (u_longlong_t)guid);
+	}
+
 	if (rebuild) {
 		if (!spa_feature_is_enabled(spa, SPA_FEATURE_DEVICE_REBUILD))
 			return (spa_vdev_exit(spa, NULL, txg, ENOTSUP));
@@ -8628,6 +8839,16 @@ spa_vdev_attach(spa_t *spa, uint64_t guid, nvlist_t *nvroot, int replacing,
 		pvd = oldvd;
 	else
 		pvd = oldvd->vdev_parent;
+
+	/*
+	 * A mirror data column of a parity set member takes at most
+	 * SPA_PARITY_MAX_SIDES sides (the eligibility check says the same).
+	 */
+	if (!replacing && pvd->vdev_ops == &vdev_mirror_ops &&
+	    !oldvd->vdev_top->vdev_islog &&
+	    pvd->vdev_children >= SPA_PARITY_MAX_SIDES &&
+	    (spa_parity_busy(spa) || spa_parity_member_on_disk(spa)))
+		return (spa_vdev_exit(spa, NULL, txg, ENOTSUP));
 
 	if (spa_config_parse(spa, &newrootvd, nvroot, NULL, 0,
 	    VDEV_ALLOC_ATTACH) != 0)
@@ -9168,7 +9389,7 @@ spa_vdev_detach(spa_t *spa, uint64_t guid, uint64_t pguid, int replace_done)
 	 * add metaslabs (i.e. grow the pool). We need to reopen the vdev
 	 * first so that we can obtain the updated sizes of the leaf vdevs.
 	 */
-	if (spa->spa_autoexpand) {
+	if (spa->spa_autoexpand && !spa_parity_expand_blocked(spa)) {
 		vdev_reopen(tvd);
 		vdev_expand(tvd, txg);
 	}
@@ -9536,6 +9757,8 @@ spa_vdev_split_mirror(spa_t *spa, const char *newname, nvlist_t *config,
 	txg = spa_vdev_enter(spa);
 
 	ASSERT(spa_namespace_held());
+	if (spa_parity_busy(spa))
+		return (spa_vdev_exit(spa, NULL, txg, ZFS_ERR_PARITY_ACTIVE));
 	if (spa_feature_is_active(spa, SPA_FEATURE_POOL_CHECKPOINT)) {
 		error = (spa_has_checkpoint(spa)) ?
 		    ZFS_ERR_CHECKPOINT_EXISTS : ZFS_ERR_DISCARDING_CHECKPOINT;
@@ -10237,6 +10460,12 @@ spa_async_autoexpand(spa_t *spa, vdev_t *vd)
 {
 	if (!spa->spa_autoexpand)
 		return;
+
+	if (spa_parity_expand_blocked(spa)) {
+		zfs_dbgmsg("parity: autoexpand of pool '%s' skipped",
+		    spa_name(spa));
+		return;
+	}
 
 	for (int c = 0; c < vd->vdev_children; c++) {
 		vdev_t *cvd = vd->vdev_child[c];
@@ -11034,6 +11263,24 @@ spa_sync_props(void *arg, dmu_tx_t *tx)
 				case ZPOOL_PROP_DEDUP_TABLE_QUOTA:
 					spa->spa_dedup_table_quota = intval;
 					break;
+				case ZPOOL_PROP_PARITYSET:
+					spa_parity_prop_sync(spa, intval, tx);
+					break;
+				case ZPOOL_PROP_PARITY_ONSTALL:
+					spa->spa_parity_onstall = intval;
+					break;
+				case ZPOOL_PROP_PARITY_PACE:
+					spa->spa_parity_pace = intval;
+					break;
+				case ZPOOL_PROP_PARITY_MAX_RECORDS:
+					spa->spa_parity_max_records = intval;
+					break;
+				case ZPOOL_PROP_PARITY_MAX_HELD:
+					spa->spa_parity_max_held = intval;
+					break;
+				case ZPOOL_PROP_PARITY_GROW_MAX:
+					spa->spa_parity_grow_max = intval;
+					break;
 				default:
 					break;
 				}
@@ -11284,9 +11531,19 @@ spa_sync_iterate_to_convergence(spa_t *spa, dmu_tx_t *tx)
 		 * most likely also be dirty due to second order effects, we
 		 * don't want to rely on that here).
 		 */
-		if (pass == 1 &&
+		boolean_t noop = (pass == 1 &&
 		    BP_GET_LOGICAL_BIRTH(&spa->spa_uberblock.ub_rootbp) < txg &&
-		    !dmu_objset_is_dirty(mos, txg)) {
+		    !dmu_objset_is_dirty(mos, txg));
+
+		/*
+		 * A lagging consumer (the parity set) releases applied records
+		 * and writes fix-ups here.  It writes nothing in a no-op txg
+		 * unless it must, so an idle pool stays idle.
+		 */
+		if (pass == 1)
+			spa_lag_sync_pass(spa, tx, noop);
+
+		if (noop && !dmu_objset_is_dirty(mos, txg)) {
 			/*
 			 * Nothing changed on the first pass, therefore this
 			 * TXG is a no-op. Avoid syncing deferred frees, so
@@ -11300,6 +11557,13 @@ spa_sync_iterate_to_convergence(spa_t *spa, dmu_tx_t *tx)
 		}
 
 		spa_sync_deferred_frees(spa, tx);
+
+		/*
+		 * Write the records of what this pass allocated and freed.
+		 * This dirties the MOS, so the loop runs again; the final pass
+		 * has no allocations and no frees, so it writes nothing.
+		 */
+		spa_lag_flush(spa, tx);
 	} while (dmu_objset_is_dirty(mos, txg));
 }
 
@@ -11428,7 +11692,7 @@ spa_sync(spa_t *spa, uint64_t txg)
 	 */
 	(void) zio_wait(spa->spa_txg_zio[txg & TXG_MASK]);
 	spa->spa_txg_zio[txg & TXG_MASK] = zio_root(spa, NULL, NULL,
-	    ZIO_FLAG_CANFAIL);
+	    ZIO_FLAG_CANFAIL | ZIO_FLAG_TXG_SYNC);
 
 	/*
 	 * Now that there can be no more cloning in this transaction group,
@@ -11564,6 +11828,9 @@ spa_sync(spa_t *spa, uint64_t txg)
 
 	dsl_pool_sync_done(dp, txg);
 
+	/* A lagging consumer takes its per-txg state (and checks it). */
+	spa_lag_txg_synced(spa, txg);
+
 	while ((vd = txg_list_remove(&spa->spa_vdev_txg_list, TXG_CLEAN(txg)))
 	    != NULL)
 		vdev_sync_done(vd, txg);
@@ -11623,6 +11890,9 @@ spa_sync(spa_t *spa, uint64_t txg)
 	if (lr != NULL)
 		zfs_rangelock_exit(lr);
 	spa_config_exit(spa, SCL_CONFIG, FTAG);
+
+	/* The parity_records event: the txg is visible to a reader now. */
+	spa_parity_txg_done(spa);
 
 	/*
 	 * An activity that ended in this txg is only over for a reader of

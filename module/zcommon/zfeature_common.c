@@ -816,6 +816,12 @@ zpool_feature_init(void)
 	    "com.klarasystems:anyraid", "anyraid", "Support for anyraid VDEV",
 	    ZFEATURE_FLAG_MOS, ZFEATURE_TYPE_BOOLEAN, NULL, sfeatures);
 
+	zfeature_register(SPA_FEATURE_PARITY_RECORDS,
+	    "org.openzfs:parity_records", "parity_records",
+	    "Lagging parity records and held frees for a parity set",
+	    ZFEATURE_FLAG_READONLY_COMPAT, ZFEATURE_TYPE_BOOLEAN, NULL,
+	    sfeatures);
+
 	zfs_mod_list_supported_free(sfeatures);
 }
 

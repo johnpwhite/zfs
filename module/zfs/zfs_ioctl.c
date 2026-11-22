@@ -163,6 +163,8 @@
 #include <sys/zap.h>
 #include <sys/spa.h>
 #include <sys/spa_impl.h>
+#include <sys/spa_parity.h>
+#include <sys/spa_parity_impl.h>
 #include <sys/vdev.h>
 #include <sys/vdev_impl.h>
 #include <sys/dmu.h>
@@ -222,6 +224,7 @@
 
 kmutex_t zfsdev_state_lock;
 static zfsdev_state_t zfsdev_state_listhead;
+static uint_t zfsdev_ioctl_state_key;
 
 /*
  * Limit maximum nvlist size.  We don't want users passing in insane values
@@ -275,6 +278,8 @@ static int zfs_ioc_userspace_upgrade(zfs_cmd_t *zc);
 static int zfs_ioc_id_quota_upgrade(zfs_cmd_t *zc);
 static int zfs_check_settable(const char *name, nvpair_t *property,
     cred_t *cr);
+static int zfs_parity_check_inherit(const char *dsname, boolean_t received);
+static int zfs_parity_check_recv_props(const char *tofs, nvlist_t *props);
 static int zfs_check_clearable(const char *dataset, nvlist_t *props,
     nvlist_t **errors);
 static int zfs_fill_zplprops_root(uint64_t, nvlist_t *, nvlist_t *,
@@ -3440,6 +3445,10 @@ zfs_ioc_inherit_prop(zfs_cmd_t *zc)
 			return (SET_ERROR(EINVAL));
 	}
 
+	if (prop == ZFS_PROP_CHECKSUM &&
+	    (err = zfs_parity_check_inherit(zc->zc_name, received)) != 0)
+		return (err);
+
 	if (prop == ZPROP_USERPROP) {
 		if (!zfs_prop_user(propname))
 			return (SET_ERROR(EINVAL));
@@ -4978,6 +4987,475 @@ zfs_ioc_ddt_prune(const char *poolname, nvlist_t *innvl, nvlist_t *outnvl)
 }
 
 /*
+ * The parity set ioctls.  The work is in spa_parity_ioctl.c.  Every reply
+ * has "parity_version".  See docs/design/interfaces.md.
+ *
+ * INFO:    innvl: { (optional) "txg" -> uint64 } (adds "txg_cksum" if known)
+ * RECORDS: innvl: { "from_txg", "cursor", "max_entries" -> uint64 }
+ * READ:    innvl: { "entry" -> uint64[18], (optional) "index" -> uint64 }
+ * READV:   innvl: { "entries" -> uint64[][18],
+ *              (optional) "indexes" -> uint64[] }
+ * CURRENT: innvl: { "phys_off" -> uint64 }
+ * VERIFY:  innvl: { "entry" -> uint64[18], "data" -> uint8[],
+ *              (optional) "index" -> uint64 }
+ * MAP:     innvl: { "txg", "from_offset", "max_ranges" -> uint64 }
+ * BLOCKS:  innvl: { "txg", "from_offset", "max_entries" -> uint64,
+ *              (optional) "windows" -> uint64[][2],
+ *              (optional) "resume" -> uint64[5] }
+ *          With windows, do not walk intent logs or return LOG entries.
+ *          Pages contain whole blocks. Clamp max_entries to at least 3.
+ *          If a block does not fit, resume at that block on the next page.
+ * LABEL:   innvl: { "txg" -> uint64 }
+ * APPLIED: innvl: { "set_guid", "generation", "txg" -> uint64 }
+ * REPAIR:  innvl: { "request" -> uint64, "data" -> uint8[] }
+ * DROP:    innvl: { "set_guid", "generation" -> uint64 }
+ */
+static const zfs_ioc_key_t zfs_keys_parity_info[] = {
+	{ZPARITY_TXG,		DATA_TYPE_UINT64,	ZK_OPTIONAL},
+};
+
+static const zfs_ioc_key_t zfs_keys_parity_records[] = {
+	{ZPARITY_FROM_TXG,	DATA_TYPE_UINT64,	0},
+	{ZPARITY_CURSOR,	DATA_TYPE_UINT64,	0},
+	{ZPARITY_MAX_ENTRIES,	DATA_TYPE_UINT64,	0},
+};
+
+static const zfs_ioc_key_t zfs_keys_parity_read[] = {
+	{ZPARITY_ENTRY,		DATA_TYPE_UINT64_ARRAY,	0},
+	{ZPARITY_INDEX,		DATA_TYPE_UINT64,	ZK_OPTIONAL},
+};
+
+static const zfs_ioc_key_t zfs_keys_parity_readv[] = {
+	{ZPARITY_ENTRIES,	DATA_TYPE_UINT64_ARRAY,	0},
+	{ZPARITY_INDEXES,	DATA_TYPE_UINT64_ARRAY,	ZK_OPTIONAL},
+};
+
+static const zfs_ioc_key_t zfs_keys_parity_current[] = {
+	{ZPARITY_PHYS_OFF,	DATA_TYPE_UINT64,	0},
+	{ZPARITY_VDEV,		DATA_TYPE_UINT64,	ZK_OPTIONAL},
+};
+
+static const zfs_ioc_key_t zfs_keys_parity_verify[] = {
+	{ZPARITY_ENTRY,		DATA_TYPE_UINT64_ARRAY,	0},
+	{ZPARITY_DATA,		DATA_TYPE_UINT8_ARRAY,	0},
+	{ZPARITY_INDEX,		DATA_TYPE_UINT64,	ZK_OPTIONAL},
+};
+
+static const zfs_ioc_key_t zfs_keys_parity_map[] = {
+	{ZPARITY_TXG,		DATA_TYPE_UINT64,	0},
+	{ZPARITY_FROM_OFFSET,	DATA_TYPE_UINT64,	0},
+	{ZPARITY_MAX_RANGES,	DATA_TYPE_UINT64,	0},
+	{ZPARITY_VDEV,		DATA_TYPE_UINT64,	ZK_OPTIONAL},
+};
+
+static const zfs_ioc_key_t zfs_keys_parity_blocks[] = {
+	{ZPARITY_TXG,		DATA_TYPE_UINT64,	0},
+	{ZPARITY_FROM_OFFSET,	DATA_TYPE_UINT64,	0},
+	{ZPARITY_MAX_ENTRIES,	DATA_TYPE_UINT64,	0},
+	{ZPARITY_WINDOWS,	DATA_TYPE_UINT64_ARRAY,	ZK_OPTIONAL},
+	{ZPARITY_RESUME,	DATA_TYPE_UINT64_ARRAY,	ZK_OPTIONAL},
+	{ZPARITY_VDEV,		DATA_TYPE_UINT64,	ZK_OPTIONAL},
+};
+
+static const zfs_ioc_key_t zfs_keys_parity_label[] = {
+	{ZPARITY_TXG,		DATA_TYPE_UINT64,	0},
+	{ZPARITY_VDEV,		DATA_TYPE_UINT64,	ZK_OPTIONAL},
+};
+
+static const zfs_ioc_key_t zfs_keys_parity_applied[] = {
+	{ZPARITY_SET_GUID,	DATA_TYPE_UINT64,	0},
+	{ZPARITY_GENERATION,	DATA_TYPE_UINT64,	0},
+	{ZPARITY_TXG,		DATA_TYPE_UINT64,	0},
+};
+
+static const zfs_ioc_key_t zfs_keys_parity_repair[] = {
+	{ZPARITY_REQUEST,	DATA_TYPE_UINT64,	0},
+	{ZPARITY_DATA,		DATA_TYPE_UINT8_ARRAY,	0},
+};
+
+static const zfs_ioc_key_t zfs_keys_parity_provider[] = {
+	{ZPARITY_POOL_GUID,	DATA_TYPE_UINT64,	0},
+};
+
+static const zfs_ioc_key_t zfs_keys_parity_supply[] = {
+	{ZPARITY_POOL_GUID,	DATA_TYPE_UINT64,	0},
+	{ZPARITY_REQUEST,	DATA_TYPE_UINT64,	0},
+	{ZPARITY_DATA,		DATA_TYPE_UINT8_ARRAY,	ZK_OPTIONAL},
+	{ZPARITY_DECLINE,	DATA_TYPE_BOOLEAN_VALUE,	ZK_OPTIONAL},
+};
+
+static const zfs_ioc_key_t zfs_keys_parity_drop[] = {
+	{ZPARITY_SET_GUID,	DATA_TYPE_UINT64,	0},
+	{ZPARITY_GENERATION,	DATA_TYPE_UINT64,	0},
+};
+
+static const zfs_ioc_key_t zfs_keys_parity_reclaim[] = {
+	{ZPARITY_TXG,		DATA_TYPE_UINT64,	ZK_OPTIONAL},
+	{ZPARITY_POOL_GUID,	DATA_TYPE_UINT64,	0},
+	{ZPARITY_RECLAIM_FLAGS, DATA_TYPE_UINT64, 0},
+	{ZPARITY_RANGES,	DATA_TYPE_UINT64_ARRAY,	ZK_OPTIONAL},
+};
+
+static void
+zfs_ioc_parity_version(nvlist_t *outnvl)
+{
+	fnvlist_add_uint64(outnvl, ZPARITY_VERSION, ZPARITY_VERSION_CURRENT);
+}
+
+static int
+zfs_ioc_parity_dispatch(zfs_ioc_t ioc, const char *poolname,
+    nvlist_t *innvl, nvlist_t *outnvl)
+{
+	spa_t *spa;
+	uint64_t txg = 0, index, *entry = NULL, *entries = NULL;
+	uint64_t *indexes = NULL, *windows = NULL;
+	uint64_t *resume = NULL, *ranges = NULL;
+	uint8_t *data = NULL;
+	uint_t nwords = 0, nindexes = 0, nwin_words = 0;
+	uint_t nresume = 0, len = 0;
+	boolean_t have_txg = B_FALSE, have_windows, have_resume;
+	boolean_t match = B_FALSE, verified = B_TRUE, repaired = B_FALSE;
+	int error;
+
+	/* Keep malformed entry requests from opening a pool. */
+	switch (ioc) {
+	case ZFS_IOC_PARITY_INFO:
+		have_txg = nvlist_lookup_uint64(innvl, ZPARITY_TXG, &txg) == 0;
+		break;
+	case ZFS_IOC_PARITY_READ:
+		if (nvlist_lookup_uint64_array(innvl, ZPARITY_ENTRY, &entry,
+		    &nwords) != 0)
+			return (SET_ERROR(EINVAL));
+		if (nvlist_lookup_uint64(innvl, ZPARITY_INDEX, &index) == 0)
+			indexes = &index;
+		break;
+	case ZFS_IOC_PARITY_READV:
+		if (nvlist_lookup_uint64_array(innvl, ZPARITY_ENTRIES, &entries,
+		    &nwords) != 0 || nwords == 0 ||
+		    nwords % PARITY_ENTRY_WORDS != 0)
+			return (SET_ERROR(EINVAL));
+		if (nvlist_exists(innvl, ZPARITY_INDEXES) &&
+		    nvlist_lookup_uint64_array(innvl, ZPARITY_INDEXES,
+		    &indexes, &nindexes) != 0)
+			return (SET_ERROR(EINVAL));
+		if ((indexes != NULL &&
+		    nindexes != nwords / PARITY_ENTRY_WORDS) ||
+		    nwords / PARITY_ENTRY_WORDS > ZPARITY_READV_MAX_ENTRIES)
+			return (SET_ERROR(EINVAL));
+		break;
+	case ZFS_IOC_PARITY_VERIFY:
+		if (nvlist_lookup_uint64_array(innvl, ZPARITY_ENTRY, &entry,
+		    &nwords) != 0 ||
+		    nvlist_lookup_uint8_array(innvl, ZPARITY_DATA,
+		    &data, &len) != 0)
+			return (SET_ERROR(EINVAL));
+		if (nvlist_lookup_uint64(innvl, ZPARITY_INDEX, &index) == 0)
+			indexes = &index;
+		break;
+	case ZFS_IOC_PARITY_REPAIR:
+		if (nvlist_lookup_uint8_array(innvl, ZPARITY_DATA,
+		    &data, &len) != 0)
+			return (SET_ERROR(EINVAL));
+		break;
+	case ZFS_IOC_PARITY_RECLAIM:
+		(void) nvlist_lookup_uint64(innvl, ZPARITY_TXG, &txg);
+		(void) nvlist_lookup_uint64_array(innvl, ZPARITY_RANGES,
+		    &ranges, &nwords);
+		break;
+	default:
+		break;
+	}
+
+	if ((error = spa_open(poolname, &spa, FTAG)) != 0)
+		return (error);
+	switch (ioc) {
+	case ZFS_IOC_PARITY_INFO:
+		error = spa_parity_ioc_info(spa, have_txg, txg, outnvl);
+		break;
+	case ZFS_IOC_PARITY_RECORDS:
+		error = spa_parity_ioc_records(spa,
+		    fnvlist_lookup_uint64(innvl, ZPARITY_FROM_TXG),
+		    fnvlist_lookup_uint64(innvl, ZPARITY_CURSOR),
+		    fnvlist_lookup_uint64(innvl, ZPARITY_MAX_ENTRIES), outnvl);
+		break;
+	case ZFS_IOC_PARITY_READ:
+		error = spa_parity_ioc_read(spa, entry, nwords, indexes,
+		    outnvl);
+		break;
+	case ZFS_IOC_PARITY_READV:
+		error = spa_parity_ioc_readv(spa, entries, nwords, indexes,
+		    nindexes, outnvl);
+		break;
+	case ZFS_IOC_PARITY_CURRENT:
+		error = spa_parity_ioc_current(spa,
+		    spa_parity_ioc_vdev(innvl),
+		    fnvlist_lookup_uint64(innvl, ZPARITY_PHYS_OFF), outnvl);
+		break;
+	case ZFS_IOC_PARITY_VERIFY:
+		error = spa_parity_ioc_verify(spa, entry, nwords, indexes, data,
+		    len, &match, &verified);
+		if (error == 0) {
+			zfs_ioc_parity_version(outnvl);
+			fnvlist_add_boolean_value(outnvl, ZPARITY_MATCH, match);
+			fnvlist_add_boolean_value(outnvl, ZPARITY_VERIFIED,
+			    verified);
+		}
+		break;
+	case ZFS_IOC_PARITY_MAP:
+		error = spa_parity_ioc_map(spa, spa_parity_ioc_vdev(innvl),
+		    fnvlist_lookup_uint64(innvl, ZPARITY_TXG),
+		    fnvlist_lookup_uint64(innvl, ZPARITY_FROM_OFFSET),
+		    fnvlist_lookup_uint64(innvl, ZPARITY_MAX_RANGES), outnvl);
+		break;
+	case ZFS_IOC_PARITY_BLOCKS:
+		{
+			uint64_t from_offset =
+			    fnvlist_lookup_uint64(innvl, ZPARITY_FROM_OFFSET);
+			uint64_t max_entries =
+			    fnvlist_lookup_uint64(innvl, ZPARITY_MAX_ENTRIES);
+
+			txg = fnvlist_lookup_uint64(innvl, ZPARITY_TXG);
+			have_windows = nvlist_exists(innvl, ZPARITY_WINDOWS);
+			have_resume = nvlist_exists(innvl, ZPARITY_RESUME);
+			if (have_resume && !have_windows) {
+				error = SET_ERROR(EINVAL);
+			} else if (have_windows &&
+			    (from_offset != 0 ||
+			    nvlist_lookup_uint64_array(innvl, ZPARITY_WINDOWS,
+			    &windows, &nwin_words) != 0 ||
+			    nwin_words % 2 != 0 ||
+			    nwin_words / 2 > PARITY_BLOCKS_WINDOWS_MAX)) {
+				error = SET_ERROR(EINVAL);
+			} else if (have_windows && have_resume &&
+			    (nvlist_lookup_uint64_array(innvl, ZPARITY_RESUME,
+			    &resume, &nresume) != 0 ||
+			    nresume != PARITY_BLOCKS_RESUME_WORDS)) {
+				error = SET_ERROR(EINVAL);
+			} else if (have_windows) {
+				error = spa_parity_ioc_blocks_windows(spa,
+				    spa_parity_ioc_vdev(innvl), txg, windows,
+				    nwin_words / 2, resume, max_entries,
+				    outnvl);
+			} else {
+				error = spa_parity_ioc_blocks(spa,
+				    spa_parity_ioc_vdev(innvl), txg,
+				    from_offset, max_entries, outnvl);
+			}
+			break;
+		}
+	case ZFS_IOC_PARITY_LABEL:
+		/* LABEL can return a reply with ESTALE. */
+		error = spa_parity_ioc_label(spa, spa_parity_ioc_vdev(innvl),
+		    fnvlist_lookup_uint64(innvl, ZPARITY_TXG), outnvl);
+		break;
+	case ZFS_IOC_PARITY_APPLIED:
+		error = spa_parity_ioc_applied(spa,
+		    fnvlist_lookup_uint64(innvl, ZPARITY_SET_GUID),
+		    fnvlist_lookup_uint64(innvl, ZPARITY_GENERATION),
+		    fnvlist_lookup_uint64(innvl, ZPARITY_TXG));
+		if (error == 0)
+			zfs_ioc_parity_version(outnvl);
+		break;
+	case ZFS_IOC_PARITY_REPAIR:
+		error = spa_parity_ioc_repair(spa,
+		    fnvlist_lookup_uint64(innvl, ZPARITY_REQUEST), data, len,
+		    &repaired);
+		if (error == 0) {
+			zfs_ioc_parity_version(outnvl);
+			fnvlist_add_boolean_value(outnvl, ZPARITY_REPAIRED,
+			    repaired);
+		}
+		break;
+	case ZFS_IOC_PARITY_DROP:
+		error = spa_parity_ioc_drop(spa,
+		    fnvlist_lookup_uint64(innvl, ZPARITY_SET_GUID),
+		    fnvlist_lookup_uint64(innvl, ZPARITY_GENERATION));
+		if (error == 0)
+			zfs_ioc_parity_version(outnvl);
+		break;
+	case ZFS_IOC_PARITY_RECLAIM:
+		error = spa_parity_ioc_reclaim(spa, txg,
+		    fnvlist_lookup_uint64(innvl, ZPARITY_POOL_GUID),
+		    fnvlist_lookup_uint64(innvl, ZPARITY_RECLAIM_FLAGS), ranges,
+		    nwords, outnvl);
+		if (error == 0)
+			zfs_ioc_parity_version(outnvl);
+		break;
+	default:
+		error = SET_ERROR(EINVAL);
+		break;
+	}
+	spa_close(spa, FTAG);
+	return (error);
+}
+
+static int
+zfs_ioc_parity_info(const char *poolname, nvlist_t *innvl, nvlist_t *outnvl)
+{
+	return (zfs_ioc_parity_dispatch(ZFS_IOC_PARITY_INFO, poolname, innvl,
+	    outnvl));
+}
+
+static int
+zfs_ioc_parity_records(const char *poolname, nvlist_t *innvl,
+    nvlist_t *outnvl)
+{
+	return (zfs_ioc_parity_dispatch(ZFS_IOC_PARITY_RECORDS, poolname, innvl,
+	    outnvl));
+}
+
+static int
+zfs_ioc_parity_read(const char *poolname, nvlist_t *innvl, nvlist_t *outnvl)
+{
+	return (zfs_ioc_parity_dispatch(ZFS_IOC_PARITY_READ, poolname, innvl,
+	    outnvl));
+}
+
+static int
+zfs_ioc_parity_readv(const char *poolname, nvlist_t *innvl,
+    nvlist_t *outnvl)
+{
+	return (zfs_ioc_parity_dispatch(ZFS_IOC_PARITY_READV, poolname, innvl,
+	    outnvl));
+}
+
+static int
+zfs_ioc_parity_current(const char *poolname, nvlist_t *innvl,
+    nvlist_t *outnvl)
+{
+	return (zfs_ioc_parity_dispatch(ZFS_IOC_PARITY_CURRENT, poolname, innvl,
+	    outnvl));
+}
+
+static int
+zfs_ioc_parity_verify(const char *poolname, nvlist_t *innvl,
+    nvlist_t *outnvl)
+{
+	return (zfs_ioc_parity_dispatch(ZFS_IOC_PARITY_VERIFY, poolname, innvl,
+	    outnvl));
+}
+
+static int
+zfs_ioc_parity_map(const char *poolname, nvlist_t *innvl, nvlist_t *outnvl)
+{
+	return (zfs_ioc_parity_dispatch(ZFS_IOC_PARITY_MAP, poolname, innvl,
+	    outnvl));
+}
+
+static int
+zfs_ioc_parity_blocks(const char *poolname, nvlist_t *innvl,
+    nvlist_t *outnvl)
+{
+	return (zfs_ioc_parity_dispatch(ZFS_IOC_PARITY_BLOCKS, poolname, innvl,
+	    outnvl));
+}
+
+static int
+zfs_ioc_parity_label(const char *poolname, nvlist_t *innvl, nvlist_t *outnvl)
+{
+	return (zfs_ioc_parity_dispatch(ZFS_IOC_PARITY_LABEL, poolname, innvl,
+	    outnvl));
+}
+
+static int
+zfs_ioc_parity_applied(const char *poolname, nvlist_t *innvl,
+    nvlist_t *outnvl)
+{
+	return (zfs_ioc_parity_dispatch(ZFS_IOC_PARITY_APPLIED, poolname, innvl,
+	    outnvl));
+}
+
+static int
+zfs_ioc_parity_repair(const char *poolname, nvlist_t *innvl,
+    nvlist_t *outnvl)
+{
+	return (zfs_ioc_parity_dispatch(ZFS_IOC_PARITY_REPAIR, poolname, innvl,
+	    outnvl));
+}
+
+static spa_t *
+zfs_ioc_parity_spa_by_guid(uint64_t pool_guid)
+{
+	spa_t *spa;
+
+	spa_namespace_enter(FTAG);
+	spa = spa_by_guid(pool_guid, 0);
+	if (spa != NULL)
+		spa_open_ref(spa, FTAG);
+	spa_namespace_exit(FTAG);
+	return (spa);
+}
+
+static int
+zfs_ioc_parity_provider(const char *poolname, nvlist_t *innvl,
+    nvlist_t *outnvl)
+{
+	zfsdev_state_t *zs = tsd_get(zfsdev_ioctl_state_key);
+	uint64_t pool_guid;
+	spa_t *spa;
+	int error;
+
+	(void) poolname, (void) outnvl;
+	/* A NO_NAME ioctl gets no zone check from the core. */
+	if (!INGLOBALZONE(curproc))
+		return (SET_ERROR(EPERM));
+	pool_guid = fnvlist_lookup_uint64(innvl, ZPARITY_POOL_GUID);
+	if ((spa = zfs_ioc_parity_spa_by_guid(pool_guid)) == NULL)
+		return (SET_ERROR(ENOENT));
+	error = spa_parity_repair_provider_register(zs, pool_guid);
+	/* Post pending requests again for the new provider. */
+	if (error == 0)
+		spa_parity_repair_repost(spa);
+	spa_close(spa, FTAG);
+	return (error);
+}
+
+static int
+zfs_ioc_parity_supply(const char *poolname, nvlist_t *innvl,
+    nvlist_t *outnvl)
+{
+	zfsdev_state_t *zs = tsd_get(zfsdev_ioctl_state_key);
+	spa_t *spa;
+	uint64_t pool_guid, request;
+	uint8_t *data = NULL;
+	uint_t len = 0;
+	boolean_t decline = B_FALSE;
+	int error;
+
+	(void) poolname, (void) outnvl;
+	if (!INGLOBALZONE(curproc))
+		return (SET_ERROR(EPERM));
+	pool_guid = fnvlist_lookup_uint64(innvl, ZPARITY_POOL_GUID);
+	if (!spa_parity_repair_provider_authorized(zs, pool_guid))
+		return (SET_ERROR(EPERM));
+	(void) nvlist_lookup_boolean_value(innvl, ZPARITY_DECLINE, &decline);
+	if (nvlist_lookup_uint8_array(innvl, ZPARITY_DATA, &data, &len) != 0 &&
+	    !decline)
+		return (SET_ERROR(EINVAL));
+	request = fnvlist_lookup_uint64(innvl, ZPARITY_REQUEST);
+	if ((spa = zfs_ioc_parity_spa_by_guid(pool_guid)) == NULL)
+		return (SET_ERROR(ENOENT));
+	error = spa_parity_repair_supply(spa, request, data, len, decline, zs);
+	spa_close(spa, FTAG);
+	return (error);
+}
+
+static int
+zfs_ioc_parity_drop(const char *poolname, nvlist_t *innvl, nvlist_t *outnvl)
+{
+	return (zfs_ioc_parity_dispatch(ZFS_IOC_PARITY_DROP, poolname, innvl,
+	    outnvl));
+}
+
+static int
+zfs_ioc_parity_reclaim(const char *poolname, nvlist_t *innvl,
+    nvlist_t *outnvl)
+{
+	return (zfs_ioc_parity_dispatch(ZFS_IOC_PARITY_RECLAIM, poolname, innvl,
+	    outnvl));
+}
+
+/*
  * This ioctl waits for activity of a particular type to complete. If there is
  * no activity of that type in progress, it returns immediately, and the
  * returned value "waited" is false. If there is activity in progress, and no
@@ -5285,6 +5763,93 @@ zfs_ioc_rename(zfs_cmd_t *zc)
 	}
 }
 
+/*
+ * A member of a parity set (parityset is on, or its records are not yet
+ * applied) refuses a checksum value of off or noparity: their checksum
+ * function accepts any bytes, so the set could neither verify nor repair such
+ * a block.  Returns ZFS_ERR_PARITY_CHECKSUM, which libzfs reports with the
+ * reason.
+ */
+static int
+zfs_parity_check_checksum(const char *dsname, uint64_t cksum)
+{
+	spa_t *spa;
+	boolean_t busy;
+	int err;
+
+	if (!spa_parity_checksum_refused(cksum))
+		return (0);
+	if ((err = spa_open(dsname, &spa, FTAG)) != 0)
+		return (err);
+	busy = spa_parity_busy(spa);
+	spa_close(spa, FTAG);
+	return (busy ? SET_ERROR(ZFS_ERR_PARITY_CHECKSUM) : 0);
+}
+
+/*
+ * The checksum value of a property list of a receive, if it has one.  A value
+ * may be a plain number or a {value, source} nvlist.
+ */
+static int
+zfs_parity_check_recv_props(const char *tofs, nvlist_t *props)
+{
+	nvpair_t *pair;
+	uint64_t cksum;
+
+	if (props == NULL || nvlist_lookup_nvpair(props,
+	    zfs_prop_to_name(ZFS_PROP_CHECKSUM), &pair) != 0)
+		return (0);
+	if (nvpair_type(pair) == DATA_TYPE_NVLIST) {
+		nvlist_t *attrs;
+
+		if (nvpair_value_nvlist(pair, &attrs) != 0 ||
+		    nvlist_lookup_nvpair(attrs, ZPROP_VALUE, &pair) != 0)
+			return (0);
+	}
+	if (nvpair_type(pair) != DATA_TYPE_UINT64 ||
+	    nvpair_value_uint64(pair, &cksum) != 0)
+		return (0);
+	return (zfs_parity_check_checksum(tofs, cksum));
+}
+
+/*
+ * zfs inherit checksum: the new value is the value of the parent (or the
+ * received value, for inherit -S).  The dataset of a pool root inherits the
+ * default.
+ */
+static int
+zfs_parity_check_inherit(const char *dsname, boolean_t received)
+{
+	char parent[ZFS_MAX_DATASET_NAME_LEN];
+	char *slash;
+	uint64_t cksum;
+	int err;
+
+	if (received) {
+		nvlist_t *recvd;
+		nvlist_t *attrs;
+
+		if (dsl_prop_get_received(dsname, &recvd) != 0)
+			return (0);
+		err = 0;
+		if (nvlist_lookup_nvlist(recvd,
+		    zfs_prop_to_name(ZFS_PROP_CHECKSUM), &attrs) == 0 &&
+		    nvlist_lookup_uint64(attrs, ZPROP_VALUE, &cksum) == 0)
+			err = zfs_parity_check_checksum(dsname, cksum);
+		nvlist_free(recvd);
+		return (err);
+	}
+
+	(void) strlcpy(parent, dsname, sizeof (parent));
+	if ((slash = strrchr(parent, '/')) == NULL)
+		return (0);
+	*slash = '\0';
+	if ((err = dsl_prop_get_integer(parent,
+	    zfs_prop_to_name(ZFS_PROP_CHECKSUM), &cksum, NULL)) != 0)
+		return (0);
+	return (zfs_parity_check_checksum(dsname, cksum));
+}
+
 static int
 zfs_check_settable(const char *dsname, nvpair_t *pair, cred_t *cr)
 {
@@ -5506,6 +6071,24 @@ zfs_check_settable(const char *dsname, nvpair_t *pair, cred_t *cr)
 		if (prop == ZFS_PROP_DEDUP &&
 		    zfs_earlier_version(dsname, SPA_VERSION_DEDUP))
 			return (SET_ERROR(ENOTSUP));
+
+		/*
+		 * A member of a parity set refuses checksum=off and noparity:
+		 * their checksum function accepts any bytes, so the set could
+		 * neither verify nor repair such a block.
+		 */
+		/*
+		 * This also covers a received property and a property of a
+		 * dataset that a create sets (both come here).  A dataset made
+		 * under a parent inherits the parent value, and a member has no
+		 * parent with off or noparity, so only an explicit value can
+		 * be refused.
+		 */
+		if (prop == ZFS_PROP_CHECKSUM &&
+		    nvpair_type(pair) == DATA_TYPE_UINT64 &&
+		    nvpair_value_uint64(pair, &intval) == 0 &&
+		    (err = zfs_parity_check_checksum(dsname, intval)) != 0)
+			return (err);
 
 		if (nvpair_type(pair) == DATA_TYPE_UINT64 &&
 		    nvpair_value_uint64(pair, &intval) == 0) {
@@ -5763,6 +6346,11 @@ zfs_ioc_recv_impl(char *tofs, char *tosnap, const char *origin,
 
 	if ((input_fp = zfs_file_get(input_fd)) == NULL)
 		return (SET_ERROR(EBADF));
+
+	/* Refuse now: a property error after the stream starts is not fatal. */
+	if ((error = zfs_parity_check_recv_props(tofs, recvprops)) != 0 ||
+	    (error = zfs_parity_check_recv_props(tofs, localprops)) != 0)
+		goto out;
 
 	noff = off = zfs_file_off(input_fp);
 	error = dmu_recv_begin(tofs, tosnap, begin_record, force, heal,
@@ -8205,6 +8793,86 @@ zfs_ioctl_init(void)
 	    POOL_CHECK_SUSPENDED | POOL_CHECK_READONLY, B_TRUE, B_TRUE,
 	    zfs_keys_ddt_prune, ARRAY_SIZE(zfs_keys_ddt_prune));
 
+	/*
+	 * Parity set.  INFO, RECORDS, READ, VERIFY, MAP, BLOCKS and LABEL
+	 * only read, and work on a pool that is read-only.  DROP destroys
+	 * records, so it goes into the pool history.
+	 */
+	zfs_ioctl_register("parity_info", ZFS_IOC_PARITY_INFO,
+	    zfs_ioc_parity_info, zfs_secpolicy_config, POOL_NAME,
+	    POOL_CHECK_SUSPENDED, B_FALSE, B_FALSE,
+	    zfs_keys_parity_info, ARRAY_SIZE(zfs_keys_parity_info));
+
+	zfs_ioctl_register("parity_records", ZFS_IOC_PARITY_RECORDS,
+	    zfs_ioc_parity_records, zfs_secpolicy_config, POOL_NAME,
+	    POOL_CHECK_SUSPENDED, B_FALSE, B_FALSE,
+	    zfs_keys_parity_records, ARRAY_SIZE(zfs_keys_parity_records));
+
+	zfs_ioctl_register("parity_read", ZFS_IOC_PARITY_READ,
+	    zfs_ioc_parity_read, zfs_secpolicy_config, POOL_NAME,
+	    POOL_CHECK_SUSPENDED, B_FALSE, B_FALSE,
+	    zfs_keys_parity_read, ARRAY_SIZE(zfs_keys_parity_read));
+
+	zfs_ioctl_register("parity_readv", ZFS_IOC_PARITY_READV,
+	    zfs_ioc_parity_readv, zfs_secpolicy_config, POOL_NAME,
+	    POOL_CHECK_SUSPENDED, B_FALSE, B_FALSE,
+	    zfs_keys_parity_readv, ARRAY_SIZE(zfs_keys_parity_readv));
+
+	zfs_ioctl_register("parity_current", ZFS_IOC_PARITY_CURRENT,
+	    zfs_ioc_parity_current, zfs_secpolicy_config, POOL_NAME,
+	    POOL_CHECK_SUSPENDED, B_FALSE, B_FALSE,
+	    zfs_keys_parity_current, ARRAY_SIZE(zfs_keys_parity_current));
+
+	zfs_ioctl_register("parity_verify", ZFS_IOC_PARITY_VERIFY,
+	    zfs_ioc_parity_verify, zfs_secpolicy_config, POOL_NAME,
+	    POOL_CHECK_SUSPENDED, B_FALSE, B_FALSE,
+	    zfs_keys_parity_verify, ARRAY_SIZE(zfs_keys_parity_verify));
+
+	zfs_ioctl_register("parity_map", ZFS_IOC_PARITY_MAP,
+	    zfs_ioc_parity_map, zfs_secpolicy_config, POOL_NAME,
+	    POOL_CHECK_SUSPENDED, B_FALSE, B_FALSE,
+	    zfs_keys_parity_map, ARRAY_SIZE(zfs_keys_parity_map));
+
+	zfs_ioctl_register("parity_blocks", ZFS_IOC_PARITY_BLOCKS,
+	    zfs_ioc_parity_blocks, zfs_secpolicy_config, POOL_NAME,
+	    POOL_CHECK_SUSPENDED, B_FALSE, B_FALSE,
+	    zfs_keys_parity_blocks, ARRAY_SIZE(zfs_keys_parity_blocks));
+
+	zfs_ioctl_register("parity_label", ZFS_IOC_PARITY_LABEL,
+	    zfs_ioc_parity_label, zfs_secpolicy_config, POOL_NAME,
+	    POOL_CHECK_SUSPENDED, B_FALSE, B_FALSE,
+	    zfs_keys_parity_label, ARRAY_SIZE(zfs_keys_parity_label));
+
+	zfs_ioctl_register("parity_applied", ZFS_IOC_PARITY_APPLIED,
+	    zfs_ioc_parity_applied, zfs_secpolicy_config, POOL_NAME,
+	    POOL_CHECK_SUSPENDED | POOL_CHECK_READONLY, B_FALSE, B_FALSE,
+	    zfs_keys_parity_applied, ARRAY_SIZE(zfs_keys_parity_applied));
+
+	zfs_ioctl_register("parity_repair", ZFS_IOC_PARITY_REPAIR,
+	    zfs_ioc_parity_repair, zfs_secpolicy_config, POOL_NAME,
+	    POOL_CHECK_SUSPENDED | POOL_CHECK_READONLY, B_FALSE, B_FALSE,
+	    zfs_keys_parity_repair, ARRAY_SIZE(zfs_keys_parity_repair));
+
+	zfs_ioctl_register("parity_provider", ZFS_IOC_PARITY_PROVIDER,
+	    zfs_ioc_parity_provider, zfs_secpolicy_config, NO_NAME,
+	    POOL_CHECK_NONE, B_FALSE, B_FALSE, zfs_keys_parity_provider,
+	    ARRAY_SIZE(zfs_keys_parity_provider));
+
+	zfs_ioctl_register("parity_supply", ZFS_IOC_PARITY_SUPPLY,
+	    zfs_ioc_parity_supply, zfs_secpolicy_config, NO_NAME,
+	    POOL_CHECK_NONE, B_FALSE, B_FALSE, zfs_keys_parity_supply,
+	    ARRAY_SIZE(zfs_keys_parity_supply));
+
+	zfs_ioctl_register("parity_drop", ZFS_IOC_PARITY_DROP,
+	    zfs_ioc_parity_drop, zfs_secpolicy_config, POOL_NAME,
+	    POOL_CHECK_SUSPENDED | POOL_CHECK_READONLY, B_FALSE, B_TRUE,
+	    zfs_keys_parity_drop, ARRAY_SIZE(zfs_keys_parity_drop));
+
+	zfs_ioctl_register("parity_reclaim", ZFS_IOC_PARITY_RECLAIM,
+	    zfs_ioc_parity_reclaim, zfs_secpolicy_config, POOL_NAME,
+	    POOL_CHECK_SUSPENDED | POOL_CHECK_READONLY, B_FALSE, B_TRUE,
+	    zfs_keys_parity_reclaim, ARRAY_SIZE(zfs_keys_parity_reclaim));
+
 	/* IOCTLS that use the legacy function signature */
 
 	zfs_ioctl_register_legacy(ZFS_IOC_POOL_FREEZE, zfs_ioc_pool_freeze,
@@ -8574,6 +9242,7 @@ zfsdev_state_destroy(void *priv)
 
 	ASSERT(zs != NULL);
 	ASSERT3S(zs->zs_minor, >, 0);
+	spa_parity_repair_provider_unregister(zs);
 
 	/*
 	 * The last reference to this zfsdev file descriptor is being dropped.
@@ -8592,7 +9261,8 @@ zfsdev_state_destroy(void *priv)
 }
 
 long
-zfsdev_ioctl_common(uint_t vecnum, zfs_cmd_t *zc, int flag)
+zfsdev_ioctl_common(uint_t vecnum, zfs_cmd_t *zc, int flag,
+    zfsdev_state_t *zs)
 {
 	int error, cmd;
 	const zfs_ioc_vec_t *vec;
@@ -8730,6 +9400,7 @@ zfsdev_ioctl_common(uint_t vecnum, zfs_cmd_t *zc, int flag)
 		int puterror = 0;
 		spa_t *spa;
 		nvlist_t *lognv = NULL;
+		void *old_state;
 
 		ASSERT0P(vec->zvec_legacy_func);
 
@@ -8749,7 +9420,10 @@ zfsdev_ioctl_common(uint_t vecnum, zfs_cmd_t *zc, int flag)
 
 		outnvl = fnvlist_alloc();
 		cookie = spl_fstrans_mark();
+		old_state = tsd_get(zfsdev_ioctl_state_key);
+		(void) tsd_set(zfsdev_ioctl_state_key, zs);
 		error = vec->zvec_func(zc->zc_name, innvl, outnvl);
+		(void) tsd_set(zfsdev_ioctl_state_key, old_state);
 		spl_fstrans_unmark(cookie);
 
 		/*
@@ -8841,11 +9515,16 @@ zfs_kmod_init(void)
 	mutex_init(&zfsdev_state_lock, NULL, MUTEX_DEFAULT, NULL);
 	zfsdev_state_listhead.zs_minor = -1;
 
-	if ((error = zfsdev_attach()) != 0)
-		goto out;
-
+	/* Ioctls can arrive as soon as the device is attached. */
 	tsd_create(&rrw_tsd_key, rrw_tsd_destroy);
 	tsd_create(&zfs_allow_log_key, zfs_allow_log_destroy);
+	tsd_create(&zfsdev_ioctl_state_key, NULL);
+	if ((error = zfsdev_attach()) != 0) {
+		tsd_destroy(&zfsdev_ioctl_state_key);
+		tsd_destroy(&zfs_allow_log_key);
+		tsd_destroy(&rrw_tsd_key);
+		goto out;
+	}
 
 	return (0);
 out:
@@ -8867,6 +9546,7 @@ zfs_kmod_fini(void)
 
 	for (zs = &zfsdev_state_listhead; zs != NULL; zs = zsnext) {
 		zsnext = zs->zs_next;
+		spa_parity_repair_provider_unregister(zs);
 		if (zs->zs_onexit)
 			zfs_onexit_destroy(zs->zs_onexit);
 		if (zs->zs_zevent)
@@ -8886,6 +9566,7 @@ zfs_kmod_fini(void)
 
 	tsd_destroy(&rrw_tsd_key);
 	tsd_destroy(&zfs_allow_log_key);
+	tsd_destroy(&zfsdev_ioctl_state_key);
 }
 
 ZFS_MODULE_PARAM(zfs, zfs_, max_nvlist_src_size, U64, ZMOD_RW,

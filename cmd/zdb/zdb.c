@@ -84,6 +84,7 @@
 #include <sys/vdev_raidz_impl.h>
 #include <sys/zstd/zstd.h>
 #include <sys/backtrace.h>
+#include <sys/spa_parity_impl.h>
 
 #include <libzpool.h>
 #include <libnvpair.h>
@@ -108,6 +109,7 @@ enum {
 	ARG_BLOCK_BIN_MODE,
 	ARG_BLOCK_CLASSES,
 	ARG_ANYRAID_MAP,
+	ARG_PARITY,
 };
 
 static const char cmdname[] = "zdb";
@@ -728,10 +730,11 @@ usage(void)
 	    "\t%s -E [-A] word0:word1:...:word15\n"
 	    "\t%s -S [-AP] [-e [-V] [-p <path> ...]] [-U <cache>] "
 	    "<poolname>\n"
-	    "\t%s --anyraid-map <poolname> [<vdev> ...]\n\n",
+	    "\t%s --anyraid-map <poolname> [<vdev> ...]\n"
+	    "\t%s --parity [-v] [-e [-V] [-p <path> ...]] <poolname>\n\n",
 	    cmdname, cmdname, cmdname, cmdname, cmdname, cmdname, cmdname,
 	    cmdname, cmdname, cmdname, cmdname, cmdname, cmdname, cmdname,
-	    cmdname);
+	    cmdname, cmdname);
 
 	(void) fprintf(stderr, "    Dataset name must include at least one "
 	    "separator character '/' or '@'\n");
@@ -6282,6 +6285,7 @@ typedef struct zdb_cb {
 	zdb_blkstats_t	zcb_type[ZB_TOTAL + 1][ZDB_OT_TOTAL + 1];
 	uint64_t	zcb_removing_size;
 	uint64_t	zcb_checkpoint_size;
+	uint64_t	zcb_parity_held_size;
 	uint64_t	zcb_dedup_asize;
 	uint64_t	zcb_dedup_blocks;
 	uint64_t	zcb_clone_asize;
@@ -7516,6 +7520,137 @@ zdb_leak_init_prepare_indirect_vdevs(spa_t *spa, zdb_cb_t *zcb)
 	}
 }
 
+/*
+ * A parity set member holds the frees of blocks that its parity has not
+ * applied yet: the blocks are not in the block tree, and their space is still
+ * allocated in the space maps.  Claim the held ranges (the DVAs of the FREE
+ * entries that the release has not reached) like the traversal claims a live
+ * block, so that they are not reported as leaks.  Free entries of intent log
+ * blocks are not held.
+ */
+static void
+zdb_leak_init_parity(spa_t *spa, zdb_cb_t *zcb)
+{
+	objset_t *mos = spa->spa_meta_objset;
+	uint64_t dir[SPA_LAG_DIR_WORDS];
+	zap_cursor_t zc;
+	zap_attribute_t *za;
+	uint64_t *buf;
+	int error, cursor_error;
+
+	error = spa_lag_dir_read(mos, PARITY_DIR_NAME, dir);
+	if (error != 0) {
+		if (error != ENOENT) {
+			zcb->zcb_haderrors = 1;
+			if (error > 0 &&
+			    (uint_t)error < ARRAY_SIZE(zcb->zcb_errors))
+				zcb->zcb_errors[error]++;
+		}
+		return;
+	}
+
+	buf = kmem_alloc(1 << 20, KM_SLEEP);
+	za = zap_attribute_alloc();
+	zap_cursor_init(&zc, mos, dir[SLD_INDEX]);
+	while ((cursor_error = zap_cursor_retrieve(&zc, za)) == 0) {
+		uint64_t txg = *(uint64_t *)za->za_name;
+		spa_lag_rec_phys_t pr;
+		uint64_t per = (1 << 20) / (PARITY_ENTRY_WORDS * 8);
+
+		if (txg == SPA_LAG_STATE_KEY) {
+			zap_cursor_advance(&zc);
+			continue;
+		}
+		error = zap_lookup_uint64(mos, dir[SLD_INDEX], &txg, 1,
+		    sizeof (uint64_t), SPA_LAG_REC_WORDS, &pr);
+		if (error != 0) {
+			zcb->zcb_haderrors = 1;
+			if (error > 0 &&
+			    (uint_t)error < ARRAY_SIZE(zcb->zcb_errors))
+				zcb->zcb_errors[error]++;
+			zap_cursor_advance(&zc);
+			continue;
+		}
+		for (uint64_t i = pr.pr_rel_index; i < pr.pr_nentries;
+		    i += per) {
+			uint64_t cnt = MIN(per, pr.pr_nentries - i);
+
+			error = dmu_read(mos, pr.pr_obj,
+			    i * PARITY_ENTRY_WORDS * 8,
+			    cnt * PARITY_ENTRY_WORDS * 8, buf,
+			    DMU_READ_PREFETCH);
+			if (error != 0) {
+				zcb->zcb_haderrors = 1;
+				if (error > 0 &&
+				    (uint_t)error < ARRAY_SIZE(zcb->zcb_errors))
+					zcb->zcb_errors[error]++;
+				break;
+			}
+			for (uint64_t j = 0; j < cnt; j++) {
+				const uint64_t *w =
+				    &buf[j * PARITY_ENTRY_WORDS];
+				const blkptr_t *bp =
+				    (const blkptr_t *)&w[PARITY_EW_BP];
+				int claim_err;
+
+				if (w[PARITY_EW_KIND] != PARITY_KIND_FREE ||
+				    BP_IS_HOLE(bp) ||
+				    BP_GET_TYPE(bp) == DMU_OT_INTENT_LOG)
+					continue;
+				/*
+				 * The DVAs only, as the release frees them:
+				 * a gang DVA is its header.  The children of
+				 * a held gang block were freed one by one, so
+				 * they have FREE entries of their own, and
+				 * zio_claim() of the gang tree would claim
+				 * them twice.
+				 */
+				claim_err = metaslab_claim(spa, bp,
+				    spa_min_claim_txg(spa));
+				if (claim_err != 0) {
+					char blkbuf[BP_SPRINTF_LEN];
+
+					snprintf_blkptr(blkbuf, sizeof (blkbuf),
+					    bp);
+					(void) printf("held free claim error "
+					    "%d: %s\n", claim_err, blkbuf);
+					zcb->zcb_haderrors = 1;
+				} else {
+					/*
+					 * The block traversal does not see a
+					 * held block: count its space as found.
+					 */
+					spa_config_enter(spa, SCL_VDEV, FTAG,
+					    RW_READER);
+					for (int d = 0; d < BP_GET_NDVAS(bp);
+					    d++) {
+						const dva_t *dva =
+						    &bp->blk_dva[d];
+
+						zcb->zcb_parity_held_size +=
+						    DVA_GET_GANG(dva) ?
+						    vdev_gang_header_asize(
+						    vdev_lookup_top(spa,
+						    DVA_GET_VDEV(dva))) :
+						    DVA_GET_ASIZE(dva);
+					}
+					spa_config_exit(spa, SCL_VDEV, FTAG);
+				}
+			}
+		}
+		zap_cursor_advance(&zc);
+	}
+	if (cursor_error != ENOENT) {
+		zcb->zcb_haderrors = 1;
+		if (cursor_error > 0 &&
+		    (uint_t)cursor_error < ARRAY_SIZE(zcb->zcb_errors))
+			zcb->zcb_errors[cursor_error]++;
+	}
+	zap_cursor_fini(&zc);
+	zap_attribute_free(za);
+	kmem_free(buf, 1 << 20);
+}
+
 static void
 zdb_leak_init(spa_t *spa, zdb_cb_t *zcb)
 {
@@ -7571,6 +7706,9 @@ zdb_leak_init(spa_t *spa, zdb_cb_t *zcb)
 	 */
 	zdb_leak_init_exclude_checkpoint(spa, zcb);
 	ASSERT3U(zcb->zcb_checkpoint_size, ==, spa_get_checkpoint_space(spa));
+
+	/* The frees that a parity set holds are allocated, not leaked. */
+	zdb_leak_init_parity(spa, zcb);
 
 	/* for cleaner progress output */
 	(void) fprintf(stderr, "\n");
@@ -8070,6 +8208,18 @@ dump_block_stats(spa_t *spa)
 	 * Report any leaked segments.
 	 */
 	leaks |= zdb_leak_fini(spa, zcb);
+	if (dump_opt['b'] != 0) {
+		uint64_t errors = 0;
+
+		for (uint_t e = 0; e < ARRAY_SIZE(zcb->zcb_errors); e++)
+			errors += zcb->zcb_errors[e];
+		if (zcb->zcb_haderrors && errors == 0)
+			errors = 1;
+		(void) printf("parity reclaim: pool_guid %llu, txg %llu, "
+		    "errors %llu\n", (u_longlong_t)spa_guid(spa),
+		    (u_longlong_t)spa->spa_uberblock.ub_txg,
+		    (u_longlong_t)errors);
+	}
 
 	tzb = &zcb->zcb_type[ZB_TOTAL][ZDB_OT_TOTAL];
 
@@ -8085,7 +8235,8 @@ dump_block_stats(spa_t *spa)
 	    get_unflushed_alloc_space(spa);
 	total_found =
 	    tzb->zb_asize - zcb->zcb_dedup_asize - zcb->zcb_clone_asize +
-	    zcb->zcb_removing_size + zcb->zcb_checkpoint_size;
+	    zcb->zcb_removing_size + zcb->zcb_checkpoint_size +
+	    zcb->zcb_parity_held_size;
 
 	if (total_found == total_alloc && !dump_opt['L']) {
 		(void) printf("\n\tNo leaks (block sum matches space"
@@ -9222,6 +9373,7 @@ dump_mos_leaks(spa_t *spa)
 		vdev_indirect_mapping_close(vim);
 	}
 	deleted_livelists_dump_mos(spa);
+	(void) spa_parity_mos_objs(spa, mos_obj_refd);
 
 	if (dp->dp_origin_snap != NULL) {
 		dsl_dataset_t *ds;
@@ -10625,6 +10777,96 @@ zdb_dump_anyraid_map_vdev(vdev_t *vd, int verbosity)
 		zdb_print_anyraid_ondisk_maps(vd, verbosity);
 }
 
+/*
+ * --parity: the parity set's directory entry and records.  With -v, every
+ * entry of every record.
+ */
+static int
+zdb_dump_parity(spa_t *spa, int verbosity)
+{
+	static const char *kinds[] = { "VOID", "ALLOC", "FREE", "FIXUP" };
+	objset_t *mos = spa->spa_meta_objset;
+	uint64_t dir[SPA_LAG_DIR_WORDS];
+	zap_cursor_t zc;
+	zap_attribute_t *za;
+	int error;
+
+	error = spa_lag_dir_read(mos, PARITY_DIR_NAME, dir);
+	if (error == ENOENT) {
+		(void) printf("parity set: no records\n");
+		return (0);
+	}
+	if (error != 0)
+		return (error);
+	(void) printf("parity set: version %llu, index %llu, state %llu, "
+	    "start %llu, stop %llu, generation %llu, applied %llu\n",
+	    (u_longlong_t)dir[SLD_VERSION], (u_longlong_t)dir[SLD_INDEX],
+	    (u_longlong_t)(dir[SLD_STATE] & PARITY_DIR_STATE_MASK),
+	    (u_longlong_t)dir[SLD_START],
+	    (u_longlong_t)dir[SLD_STOP], (u_longlong_t)dir[SLD_GENERATION],
+	    (u_longlong_t)dir[SLD_APPLIED]);
+
+	za = zap_attribute_alloc();
+	for (zap_cursor_init(&zc, mos, dir[SLD_INDEX]);
+	    (error = zap_cursor_retrieve(&zc, za)) == 0;
+	    zap_cursor_advance(&zc)) {
+		uint64_t txg = *(uint64_t *)za->za_name;
+		spa_lag_rec_phys_t pr;
+		uint64_t *buf;
+		size_t len;
+
+		if (txg == SPA_LAG_STATE_KEY)
+			continue;
+		error = zap_lookup_uint64(mos, dir[SLD_INDEX], &txg, 1,
+		    sizeof (uint64_t), SPA_LAG_REC_WORDS, &pr);
+		if (error != 0)
+			break;
+		(void) printf("  record txg %llu: time %llu, object %llu, "
+		    "%llu entries, "
+		    "%llu fix-ups, alloc %llu, held %llu, released %llu/%llu, "
+		    "previous txg %llu, reserved %llu %llu %llu %llu\n",
+		    (u_longlong_t)txg, (u_longlong_t)pr.pr_time,
+		    (u_longlong_t)pr.pr_obj, (u_longlong_t)pr.pr_nentries,
+		    (u_longlong_t)pr.pr_nfixups,
+		    (u_longlong_t)pr.pr_alloc_asize,
+		    (u_longlong_t)pr.pr_held_asize,
+		    (u_longlong_t)pr.pr_rel_index,
+		    (u_longlong_t)pr.pr_rel_asize,
+		    (u_longlong_t)pr.pr_prev_txg,
+		    (u_longlong_t)pr.pr_reserved[0],
+		    (u_longlong_t)pr.pr_reserved[1],
+		    (u_longlong_t)pr.pr_reserved[2],
+		    (u_longlong_t)pr.pr_reserved[3]);
+		if (verbosity < 1 || pr.pr_nentries == 0)
+			continue;
+
+		len = pr.pr_nentries * PARITY_ENTRY_WORDS * sizeof (uint64_t);
+		buf = kmem_alloc(len, KM_SLEEP);
+		error = dmu_read(mos, pr.pr_obj, 0, len, buf,
+		    DMU_READ_PREFETCH);
+		if (error != 0) {
+			kmem_free(buf, len);
+			break;
+		}
+		for (uint64_t i = 0; i < pr.pr_nentries; i++) {
+			const uint64_t *w = &buf[i * PARITY_ENTRY_WORDS];
+			uint64_t kind = w[PARITY_EW_KIND];
+			char blkbuf[BP_SPRINTF_LEN];
+
+			snprintf_blkptr(blkbuf, sizeof (blkbuf),
+			    (const blkptr_t *)&w[PARITY_EW_BP]);
+			(void) printf("    %6llu txg %llu %-5s %s\n",
+			    (u_longlong_t)i, (u_longlong_t)w[PARITY_EW_TXG],
+			    kind < ARRAY_SIZE(kinds) ? kinds[kind] : "?",
+			    blkbuf);
+		}
+		kmem_free(buf, len);
+	}
+	zap_cursor_fini(&zc);
+	zap_attribute_free(za);
+	return (error == ENOENT ? 0 : error);
+}
+
 static int
 zdb_dump_anyraid_map(char *vdev_str, spa_t *spa, int verbosity)
 {
@@ -10665,6 +10907,7 @@ main(int argc, char **argv)
 {
 	int c, long_index;
 	boolean_t opt_anyraid_map = B_FALSE;
+	boolean_t opt_parity = B_FALSE;
 	int dump_all = 1;
 	int verbose = 0;
 	int error = 0;
@@ -10772,6 +11015,8 @@ main(int argc, char **argv)
 		    ARG_BLOCK_CLASSES},
 		{"anyraid-map",		no_argument,		NULL,
 		    ARG_ANYRAID_MAP},
+		{"parity",			no_argument,		NULL,
+		    ARG_PARITY},
 		{0, 0, 0, 0}
 	};
 
@@ -10942,6 +11187,10 @@ main(int argc, char **argv)
 		}
 		case ARG_ANYRAID_MAP:
 			opt_anyraid_map = B_TRUE;
+			dump_all = 0;
+			break;
+		case ARG_PARITY:
+			opt_parity = B_TRUE;
 			dump_all = 0;
 			break;
 		default:
@@ -11387,6 +11636,8 @@ retry_lookup:
 	argc--;
 	if (dump_opt['r']) {
 		error = zdb_copy_object(os, object, argv[1]);
+	} else if (opt_parity) {
+		error = zdb_dump_parity(spa, verbose);
 	} else if (opt_anyraid_map) {
 		if (argc == 0)
 			error = zdb_dump_anyraid_map(NULL, spa, verbose);

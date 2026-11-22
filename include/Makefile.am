@@ -88,7 +88,10 @@ COMMON_H = \
 	sys/spa_checkpoint.h \
 	sys/spa_checksum.h \
 	sys/spa_impl.h \
+	sys/spa_lag.h \
 	sys/spa_log_spacemap.h \
+	sys/spa_parity.h \
+	sys/spa_parity_impl.h \
 	sys/space_map.h \
 	sys/space_reftree.h \
 	sys/sysevent.h \

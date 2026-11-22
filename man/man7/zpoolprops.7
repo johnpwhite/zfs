@@ -624,6 +624,188 @@ See
 for additional details.
 The default value is
 .Sy off .
+.It Sy parity_grow_max Ns = Ns Ar bytes
+The largest size, in bytes of top-level vdev space, that the pool may grow to
+while it is a member of a parity set with unapplied records.
+The parity set software must cover the new size before the pool grows, so
+set this property only after the set has granted the growth
+.Pq Nm zparity Cm grow Fl -grant .
+A larger disk, an online expansion or
+.Sy autoexpand
+then grows the pool up to this size and not further.
+The value
+.Sy 0
+means that such a pool does not grow at all.
+A pool that is not a member, or that has no unapplied records, ignores it.
+The default value is
+.Sy 0 .
+.It Sy parity_max_held Ns = Ns Ar number
+The most space that held freed blocks may use, as a percentage of the pool
+space, when the pool is a member of a parity set.
+When the held space reaches this limit, the pool applies the
+.Sy parity_onstall
+policy.
+The value
+.Sy 0
+means the module default, see
+.Sy zfs_parity_max_held_pct
+in
+.Xr zfs 4 .
+The default value is
+.Sy 0 .
+.It Sy parity_max_records Ns = Ns Ar bytes
+The most space that unapplied parity records may use, in bytes, when the pool is
+a member of a parity set.
+When the records reach this limit, the pool applies the
+.Sy parity_onstall
+policy.
+The value
+.Sy 0
+means the module default, see
+.Sy zfs_parity_max_record_bytes
+in
+.Xr zfs 4 .
+The default value is
+.Sy 0 .
+.It Sy parity_onstall Ns = Ns Sy continue Ns | Ns Sy wait
+Controls what the pool does at the hard limit of a parity set, that is, when the
+parity software does not keep up with the writes and a limit set by
+.Sy parity_max_records
+or
+.Sy parity_max_held
+is reached.
+.Bl -tag -compact -offset 4n -width "continue"
+.It Sy continue
+The pool drops its records and releases its held blocks.
+It keeps accepting writes.
+It posts the
+.Sy sysevent.fs.zfs.parity_unprotected
+event.
+The pool is then not protected by the parity set, and the set must resync the
+pool.
+.Nm zpool Cm parity Cm status
+shows
+.Qq not protected, resync needed .
+.It Sy wait
+Writers wait until the parity software applies records and the limit is no
+longer reached.
+The pool stays protected.
+A writer can wait for a long time if the parity software is not running.
+.El
+.Pp
+The default value is
+.Sy continue .
+.It Sy parity_pace Ns = Ns Sy on Ns | Ns Sy off
+Controls whether writers of a parity set member follow the rate at which the
+parity software applies records.
+With
+.Sy on ,
+writers are delayed from a low use of the limits
+.Po
+see
+.Sy zfs_parity_pace_min_pct
+in
+.Xr zfs 4
+.Pc ,
+on a steeper curve, so that the write rate settles at the apply rate before the
+hard limit and a long write does not make the pool drop its records.
+This keeps the pool protected, at the cost of write speed.
+Pacing applies only while the parity software reports progress: when it stops,
+the normal limits and the
+.Sy parity_onstall
+policy apply.
+With
+.Sy off ,
+writes do not wait for parity until the normal delay curve starts, and a long
+write can make the pool reach the hard limit and apply the
+.Sy parity_onstall
+policy.
+The default value is
+.Sy on .
+.It Sy parityset Ns = Ns Sy on Ns | Ns Sy off
+Controls whether the pool is a member of a parity set.
+A parity set is a group of independent single-disk pools, each of which can be
+imported alone, that share lagging parity disks.
+When this property is
+.Sy on ,
+ZFS keeps records of the blocks that the pool allocates and frees, and holds
+freed blocks until the parity software has applied them to the parity disks.
+This parity is not the parity of a
+.Sy raidz
+vdev: it is kept on other disks, and it lags the writes of the pool.
+See
+.Xr zpool-parity 8 .
+.Pp
+The pool must have one top-level vdev, the
+.Sy parity_records
+feature must be
+.Sy enabled ,
+and the pool must have no checkpoint.
+Records start a few transactions after the property is set to
+.Sy on .
+Setting the property to
+.Sy off
+does not remove the pool from the set at once.
+The pool goes to the
+.Sy draining
+state: it records no new allocations and keeps holding freed blocks until the
+parity software has applied them, or until
+.Nm zpool Cm parity Cm drop
+is used.
+Then the state is
+.Sy off .
+See
+.Xr zpool-features 7
+for the
+.Sy parity_records
+feature.
+.Pp
+A block that is written with the
+.Sy checksum
+property set to
+.Sy off
+has no checksum, so the parity software cannot test the bytes that it rebuilds
+for that block.
+Therefore setting
+.Sy parityset Ns = Ns Sy on
+fails when any dataset or volume of the pool has an effective
+.Sy checksum
+of
+.Sy off
+or
+.Sy noparity ,
+set on it or inherited.
+Set the
+.Sy checksum
+of those datasets to another value first.
+While the pool is a member, it refuses to set, inherit, create or receive a
+dataset with
+.Sy checksum Ns = Ns Sy off
+or
+.Sy noparity .
+A block that was written with
+.Sy checksum Ns = Ns Sy off
+before the pool joined the set stays readable, but the parity software gets it
+marked as not verified, and it neither verifies nor repairs it.
+.Pp
+On a member, every
+.Nm zpool Cm replace
+is a sequential rebuild, followed by the automatic scrub, also when
+.Fl s
+is not given.
+A healing resilver would miss the freed blocks that are held.
+The replace fails if the
+.Sy device_rebuild
+feature is not enabled.
+.Pp
+To arm a pool that was rebuilt from parity before its first write, import it
+with
+.Nm zpool Cm import Fl o Sy parityset Ns = Ns Sy on .
+A read-only import loads the records so that
+.Nm zpool Cm parity Cm status
+can show them, but it never writes.
+The default value is
+.Sy off .
 .It Sy version Ns = Ns Ar version
 The current on-disk version of the pool.
 This can be increased, but never decreased.

@@ -124,6 +124,7 @@ zfsdev_ioctl(struct cdev *dev, ulong_t zcmd, caddr_t arg, int flag,
 	int vecnum;
 	zfs_iocparm_t *zp;
 	zfs_cmd_t *zc;
+	zfsdev_state_t *zs;
 	int rc, error;
 	void *uaddr;
 
@@ -146,7 +147,10 @@ zfsdev_ioctl(struct cdev *dev, ulong_t zcmd, caddr_t arg, int flag,
 		error = SET_ERROR(EFAULT);
 		goto out;
 	}
-	error = zfsdev_ioctl_common(vecnum, zc, 0);
+	error = devfs_get_cdevpriv((void **)&zs);
+	if (error != 0)
+		goto out;
+	error = zfsdev_ioctl_common(vecnum, zc, 0, zs);
 	rc = copyout(zc, uaddr, sizeof (*zc));
 	if (error == 0 && rc != 0)
 		error = SET_ERROR(EFAULT);

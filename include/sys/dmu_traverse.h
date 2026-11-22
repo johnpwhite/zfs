@@ -29,6 +29,7 @@ struct dnode_phys;
 struct dsl_dataset;
 struct zilog;
 struct arc_buf;
+struct uberblock;
 
 typedef int (blkptr_cb_t)(spa_t *spa, zilog_t *zilog, const blkptr_t *bp,
     const zbookmark_phys_t *zb, const struct dnode_phys *dnp, void *arg);
@@ -68,6 +69,11 @@ int traverse_dataset_destroyed(spa_t *spa, blkptr_t *blkptr,
     blkptr_cb_t func, void *arg);
 int traverse_pool(spa_t *spa,
     uint64_t txg_start, int flags, blkptr_cb_t func, void *arg);
+int traverse_pool_at_uberblock(spa_t *spa, const struct uberblock *ub,
+    int flags, blkptr_cb_t func, void *arg);
+int traverse_pool_at_uberblock_resume(spa_t *spa, const struct uberblock *ub,
+    uint64_t resume_ds_obj, zbookmark_phys_t *resume, int flags,
+    blkptr_cb_t func, void *arg);
 
 /*
  * Note that this calculation cannot overflow with the current maximum indirect
