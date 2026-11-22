@@ -914,6 +914,36 @@ tests = ['online_offline_001_pos', 'online_offline_002_neg',
     'online_offline_003_neg']
 tags = ['functional', 'online_offline']
 
+[tests/functional/parity_set]
+tests = ['parity_enable_pos', 'parity_hold_pos', 'parity_trim_pos',
+    'parity_kstat_pos', 'parity_readv_once_pos', 'parity_pace_default_pos',
+    'parity_cols_eligible_pos', 'parity_cols_eligible_neg',
+    'parity_cols_add_pos', 'parity_cols_add_neg', 'parity_cols_attach_pos',
+    'parity_cols_degraded_pos', 'parity_cols_rebuild_read_neg',
+    'parity_cols_split_neg', 'parity_cols_info_pos',
+    'parity_cols_label_pos', 'parity_label_lag_pos',
+    'parity_space_pos', 'parity_release_pos', 'parity_drop_pos',
+    'parity_idle_pos', 'parity_throttle_pos', 'parity_pace_pos',
+    'parity_onstall_continue_pos',
+    'parity_onstall_wait_pos', 'parity_import_alone_pos', 'parity_refuse_neg',
+    'parity_repair_pos', 'parity_repair_mirror_pos',
+    'parity_repair_wait_pos', 'parity_repair_decline_pos',
+    'parity_repair_errlog_pos',
+    'parity_repair_free_race_pos', 'parity_reclaim_pos', 'parity_reclaim_neg',
+    'parity_leaked_space_pos',
+    'parity_replace_map_race_pos',
+    'parity_map_zil_error_neg',
+    'parity_repair_skip_sync_pos', 'parity_replace_pos',
+    'parity_zdb_pos',
+    'parity_format_pos', 'parity_identity_pos', 'parity_blocks_pos',
+    'parity_blocks_windows_pos', 'parity_blocks_read_pos',
+    'parity_history_gap_pos',
+    'parity_input_neg', 'parity_policy_neg', 'parity_baseline_pos',
+    'parity_arc_read_pos',
+    'parity_destroy_paused_pos', 'parity_grow_pos',
+    'parity_grow_rewind_pos', 'parity_drop_unreadable_pos']
+tags = ['functional', 'parity_set']
+
 [tests/functional/pool_checkpoint]
 tests = ['checkpoint_after_rewind', 'checkpoint_bclone',
     'checkpoint_big_rewind',

@@ -361,6 +361,8 @@ nobase_dist_datadir_zfs_tests_tests_DATA += \
 	functional/nopwrite/nopwrite.shlib \
 	functional/no_space/enospc.cfg \
 	functional/online_offline/online_offline.cfg \
+	functional/parity_set/default.cfg \
+	functional/parity_set/parity_set.kshlib \
 	functional/pool_checkpoint/pool_checkpoint.kshlib \
 	functional/projectquota/projectquota.cfg \
 	functional/projectquota/projectquota_common.kshlib \
@@ -2013,6 +2015,66 @@ nobase_dist_datadir_zfs_tests_tests_SCRIPTS += \
 	functional/pam/pam_recursive.ksh \
 	functional/pam/pam_short_password.ksh \
 	functional/pam/setup.ksh \
+	functional/parity_set/parity_arc_read_pos.ksh \
+	functional/parity_set/parity_baseline_pos.ksh \
+	functional/parity_set/parity_blocks_pos.ksh \
+	functional/parity_set/parity_blocks_read_pos.ksh \
+	functional/parity_set/parity_blocks_windows_pos.ksh \
+	functional/parity_set/parity_cols_add_neg.ksh \
+	functional/parity_set/parity_cols_eligible_neg.ksh \
+	functional/parity_set/parity_drop_unreadable_pos.ksh \
+	functional/parity_set/parity_pace_default_pos.ksh \
+	functional/parity_set/parity_reclaim_neg.ksh \
+	functional/parity_set/cleanup.ksh \
+	functional/parity_set/setup.ksh \
+	functional/parity_set/ \
+	functional/parity_set/ \
+	functional/parity_set/ \
+	functional/parity_set/parity_cols_add_pos.ksh \
+	functional/parity_set/parity_cols_attach_pos.ksh \
+	functional/parity_set/parity_cols_degraded_pos.ksh \
+	functional/parity_set/parity_cols_eligible_pos.ksh \
+	functional/parity_set/parity_cols_info_pos.ksh \
+	functional/parity_set/parity_cols_label_pos.ksh \
+	functional/parity_set/parity_cols_rebuild_read_neg.ksh \
+	functional/parity_set/parity_cols_split_neg.ksh \
+	functional/parity_set/parity_destroy_paused_pos.ksh \
+	functional/parity_set/parity_drop_pos.ksh \
+	functional/parity_set/parity_enable_pos.ksh \
+	functional/parity_set/parity_format_pos.ksh \
+	functional/parity_set/parity_grow_pos.ksh \
+	functional/parity_set/parity_grow_rewind_pos.ksh \
+	functional/parity_set/parity_history_gap_pos.ksh \
+	functional/parity_set/parity_hold_pos.ksh \
+	functional/parity_set/parity_identity_pos.ksh \
+	functional/parity_set/parity_idle_pos.ksh \
+	functional/parity_set/parity_import_alone_pos.ksh \
+	functional/parity_set/parity_input_neg.ksh \
+	functional/parity_set/parity_kstat_pos.ksh \
+	functional/parity_set/parity_label_lag_pos.ksh \
+	functional/parity_set/parity_leaked_space_pos.ksh \
+	functional/parity_set/parity_map_zil_error_neg.ksh \
+	functional/parity_set/parity_onstall_continue_pos.ksh \
+	functional/parity_set/parity_onstall_wait_pos.ksh \
+	functional/parity_set/parity_pace_pos.ksh \
+	functional/parity_set/parity_policy_neg.ksh \
+	functional/parity_set/parity_readv_once_pos.ksh \
+	functional/parity_set/parity_reclaim_pos.ksh \
+	functional/parity_set/parity_refuse_neg.ksh \
+	functional/parity_set/parity_release_pos.ksh \
+	functional/parity_set/parity_repair_decline_pos.ksh \
+	functional/parity_set/parity_repair_errlog_pos.ksh \
+	functional/parity_set/parity_repair_free_race_pos.ksh \
+	functional/parity_set/parity_repair_mirror_pos.ksh \
+	functional/parity_set/parity_repair_pos.ksh \
+	functional/parity_set/parity_repair_skip_sync_pos.ksh \
+	functional/parity_set/parity_repair_wait_pos.ksh \
+	functional/parity_set/parity_replace_map_race_pos.ksh \
+	functional/parity_set/parity_replace_pos.ksh \
+	functional/parity_set/parity_space_pos.ksh \
+	functional/parity_set/parity_throttle_pos.ksh \
+	functional/parity_set/parity_trim_pos.ksh \
+	functional/parity_set/parity_zdb_pos.ksh \
 	functional/pool_checkpoint/checkpoint_after_rewind.ksh \
 	functional/pool_checkpoint/checkpoint_bclone.ksh \
 	functional/pool_checkpoint/checkpoint_big_rewind.ksh \

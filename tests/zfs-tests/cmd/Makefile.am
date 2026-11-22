@@ -71,6 +71,13 @@ scripts_zfs_tests_bin_PROGRAMS += %D%/libzfs_input_check
 	libzfs_core.la \
 	libnvpair.la
 
+scripts_zfs_tests_bin_PROGRAMS += %D%/parity_repair_wait
+%C%_parity_repair_wait_SOURCES = %D%/parity_repair_wait.c
+%C%_parity_repair_wait_LDADD = \
+	libzfs_core.la \
+	libzfs.la \
+	libnvpair.la
+
 scripts_zfs_tests_bin_PROGRAMS += %D%/libzfs_mnttab_cache_check
 %C%_libzfs_mnttab_cache_check_LDADD = \
 	libzfs.la
